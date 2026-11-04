@@ -1,0 +1,89 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: clm-vault-demo
+  labels:
+    app.kubernetes.io/part-of: clm-vault-demo
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vault
+  namespace: clm-vault-demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: liberty-sa
+  namespace: clm-vault-demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tomcat-sa
+  namespace: clm-vault-demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nginx-sa
+  namespace: clm-vault-demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: postgres-sa
+  namespace: clm-vault-demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: signing-sa
+  namespace: clm-vault-demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dashboard-sa
+  namespace: clm-vault-demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dashboard-role
+  namespace: clm-vault-demo
+rules:
+- apiGroups: ["", "apps"]
+  resources: ["pods", "pods/exec", "pods/log", "services", "deployments", "configmaps"]
+  verbs: ["get", "list", "watch", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dashboard-rolebinding
+  namespace: clm-vault-demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: dashboard-role
+subjects:
+- kind: ServiceAccount
+  name: dashboard-sa
+  namespace: clm-vault-demo
+---
+# Role for Vault Kubernetes Auth TokenReviewer delegation
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vault-token-reviewer-binding-clm-demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+- kind: ServiceAccount
+  name: vault
+  namespace: clm-vault-demo

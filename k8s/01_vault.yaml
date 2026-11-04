@@ -1,0 +1,121 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vault-config
+  namespace: clm-vault-demo
+data:
+  vault.hcl: |
+    ui = true
+    disable_mlock = true
+
+    storage "file" {
+      path = "/vault/data"
+    }
+
+    listener "tcp" {
+      address     = "0.0.0.0:8200"
+      tls_disable = 1
+    }
+
+    api_addr     = "http://vault.clm-vault-demo.svc.cluster.local:8200"
+    cluster_addr = "http://vault.clm-vault-demo.svc.cluster.local:8201"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vault
+  namespace: clm-vault-demo
+  labels:
+    app: vault
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 8200
+    targetPort: 8200
+  - name: cluster
+    port: 8201
+    targetPort: 8201
+  selector:
+    app: vault
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vault
+  namespace: clm-vault-demo
+  labels:
+    app: vault
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vault
+  template:
+    metadata:
+      labels:
+        app: vault
+    spec:
+      serviceAccountName: vault
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: vault
+        image: registry.connect.redhat.com/hashicorp/vault:1.18.2-ubi
+        command: ["vault", "server", "-dev", "-dev-root-token-id=root", "-dev-listen-address=0.0.0.0:8200"]
+        env:
+        - name: VAULT_DEV_ROOT_TOKEN_ID
+          value: "root"
+        - name: VAULT_DEV_LISTEN_ADDRESS
+          value: "0.0.0.0:8200"
+        - name: SKIP_SETCAP
+          value: "true"
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        ports:
+        - name: http
+          containerPort: 8200
+        readinessProbe:
+          httpGet:
+            path: /v1/sys/health
+            port: 8200
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /v1/sys/health
+            port: 8200
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        volumeMounts:
+        - name: vault-data
+          mountPath: /vault/data
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+      volumes:
+      - name: vault-data
+        emptyDir: {}
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: vault
+  namespace: clm-vault-demo
+spec:
+  to:
+    kind: Service
+    name: vault
+  port:
+    targetPort: http
+  tls:
+    termination: edge

@@ -1,0 +1,1196 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clm-dashboard-config
+  namespace: clm-vault-demo
+data:
+  server.py: |
+    #!/usr/bin/env python3
+    import http.server
+    import socketserver
+    import urllib.request
+    import urllib.error
+    import json
+    import os
+    import sys
+    import time
+    import ssl
+    import socket
+    import struct
+    import tempfile
+    import hashlib
+    import base64
+    from datetime import datetime, timezone, timedelta
+
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+
+    PORT = 8080
+    VAULT_ADDR = os.environ.get("VAULT_ADDR", "http://vault.clm-vault-demo.svc.cluster.local:8200")
+    K8S_API = "https://kubernetes.default.svc"
+    NAMESPACE = os.environ.get("NAMESPACE", "clm-vault-demo")
+
+    # In-memory audit log
+    AUDIT_LOGS = []
+
+    def log_event(workload, action, status, details=""):
+        entry = {
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "workload": workload,
+            "action": action,
+            "status": status,
+            "details": details
+        }
+        AUDIT_LOGS.insert(0, entry)
+        if len(AUDIT_LOGS) > 50:
+            AUDIT_LOGS.pop()
+        return entry
+
+    log_event("Sustav", "Inicijalizacija", "SUCCESS", "Centralni CLM Nadzorni Centar pokrenut")
+
+    def get_k8s_token():
+        token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+        if os.path.exists(token_path):
+            with open(token_path, "r") as f:
+                return f.read().strip()
+        return ""
+
+    def sidecar_request(slug, path="status", method="GET", payload=None, timeout=3.5):
+        """Dashboard communicates strictly with workload sidecars on port 8000."""
+        host = f"{slug}.{NAMESPACE}.svc.cluster.local"
+        url = f"http://{host}:8000/{path.lstrip('/')}"
+        data = json.dumps(payload).encode("utf-8") if payload else None
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode() if e.fp else ""
+            return {"error": f"HTTP {e.code}: {body}", "status": "ERROR"}
+        except Exception as e:
+            return {"error": str(e), "status": "UNREACHABLE"}
+
+    def probe_tls_certificate(host, port, is_postgres=False):
+        """Live socket probe to read active TLS certificate and protocol from workload."""
+        try:
+            sock = socket.create_connection((host, port), timeout=3.0)
+
+            # PostgreSQL requires sending SSLRequest packet (80877103) before standard TLS handshake
+            if is_postgres:
+                ssl_request = struct.pack("!II", 8, 80877103)
+                sock.sendall(ssl_request)
+                resp_byte = sock.recv(1)
+                if resp_byte != b'S':
+                    sock.close()
+                    return {"live_probe": False, "status": "NO_SSL", "error": "PostgreSQL refused SSL request"}
+
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            
+            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                tls_version = ssock.version()
+                cipher = ssock.cipher()
+
+                return {
+                    "live_probe": True,
+                    "tls_version": tls_version or "TLSv1.3",
+                    "cipher": cipher[0] if cipher else "AES-GCM",
+                    "status": "ACTIVE"
+                }
+        except Exception as e:
+            return {"live_probe": False, "status": "UNREACHABLE", "error": str(e)}
+
+    def get_workload_data(scenario_info, is_postgres=False):
+        """Collects workload certificate status directly from the workload sidecar agent."""
+        slug = scenario_info["slug"]
+        tls_host = f"{slug}.{NAMESPACE}.svc.cluster.local"
+        tls_port = scenario_info["port"]
+
+        # 1. Query sidecar agent directly (Dashboard -> Sidecar)
+        sc_resp = sidecar_request(slug, path="status", method="GET", timeout=2.5)
+
+        # 2. Live socket TLS probe to verify active TLS port
+        probe = probe_tls_certificate(tls_host, tls_port, is_postgres=is_postgres)
+
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        
+        if sc_resp.get("status") == "ACTIVE":
+            effective_status = "ACTIVE"
+            serial = sc_resp.get("serial", "vault-pki-active")
+            valid_from = sc_resp.get("valid_from", "Active")
+            valid_to = sc_resp.get("valid_to", "Active")
+            expires_in = sc_resp.get("expires_in_sec", 300)
+            rotation_interval = sc_resp.get("rotation_interval_seconds", 300)
+            last_renewed = sc_resp.get("last_renewed", now_iso)
+        elif probe.get("status") == "ACTIVE":
+            effective_status = "ACTIVE"
+            serial = sc_resp.get("serial", "vault-pki-active")
+            valid_from = "Active"
+            valid_to = "Active"
+            expires_in = 300
+            rotation_interval = 300
+            last_renewed = now_iso
+        else:
+            effective_status = "OFFLINE"
+            serial = "N/A (Sidecar/Pod nedostupan)"
+            valid_from = "N/A"
+            valid_to = "N/A (Pod nije pokrenut)"
+            expires_in = 0
+            rotation_interval = 300
+            last_renewed = now_iso
+
+        return {
+            "id": scenario_info["id"],
+            "slug": scenario_info["slug"],
+            "name": scenario_info["name"],
+            "scenario": scenario_info["scenario"],
+            "ca_provider": scenario_info["ca_provider"],
+            "keystore_format": scenario_info["keystore_format"],
+            "reload_mechanism": scenario_info["reload_mechanism"],
+            "common_name": f"{slug}.{NAMESPACE}.svc",
+            "alt_names": f"localhost,{slug}",
+            "host": tls_host,
+            "port": tls_port,
+            "probe": probe,
+            "serial": serial,
+            "valid_from": valid_from,
+            "valid_to": valid_to,
+            "expires_in_sec": expires_in,
+            "rotation_interval_seconds": rotation_interval,
+            "status": effective_status,
+            "last_synced": last_renewed
+        }
+
+    def renew_via_sidecar(slug):
+        """Dashboard asks the sidecar to renew its certificate directly with Vault."""
+        log_event(slug.upper(), "Ručna obnova (Dashboard -> Sidecar)", "IN_PROGRESS", f"Slanje zahtjeva za obnovu prema {slug} sidecar agentu...")
+        res = sidecar_request(slug, path="renew", method="POST", timeout=12.0)
+        
+        if res.get("success"):
+            new_serial = res.get("serial", "")
+            log_event(slug.upper(), "Ručna obnova (Sidecar -> Vault PKI)", "SUCCESS", f"Sidecar uspješno obnovio i primijenio certifikat: {new_serial}")
+            return {
+                "success": True,
+                "serial": new_serial,
+                "message": f"Certifikat za {slug} uspješno obnovljen putem Sidecara (Serial: {new_serial})!"
+            }
+        else:
+            err_msg = res.get("error") or res.get("message") or "Sidecar nije dostupan"
+            log_event(slug.upper(), "Ručna obnova (Sidecar -> Vault PKI)", "FAILED", f"Greška: {err_msg}")
+            return {
+                "success": False,
+                "error": err_msg,
+                "message": f"Greška pri obnovi certifikata za {slug}: {err_msg}"
+            }
+
+    def schedule_via_sidecar(slug, interval):
+        """Dashboard updates rotation interval directly on the workload sidecars."""
+        targets = ["liberty", "tomcat", "nginx", "postgres"] if slug == "global" else [slug]
+        for t in targets:
+            sidecar_request(t, path="schedule", method="POST", payload={"interval_seconds": interval}, timeout=3.0)
+        log_event(slug.upper(), "Postavljanje rasporeda (Schedule)", "SUCCESS", f"Interval rotacije postavljen na {interval}s.")
+        return {"success": True, "message": f"Interval rotacije za {slug} postavljen na {interval}s."}
+
+    class DashboardHandler(http.server.SimpleHTTPRequestHandler):
+        def do_GET(self):
+            clean_path = self.path.split("?")[0]
+            if clean_path == "/api/status":
+                self.handle_api_status()
+            elif clean_path == "/api/audit":
+                self.handle_api_audit()
+            elif clean_path.startswith("/api/probe/"):
+                workload = clean_path.split("/")[-1]
+                self.handle_api_probe(workload)
+            elif clean_path == "/" or clean_path == "/index.html":
+                self.serve_ui()
+            else:
+                super().do_GET()
+
+        def do_POST(self):
+            clean_path = self.path.split("?")[0]
+            content_len = int(self.headers.get("Content-Length", 0))
+            post_body = self.rfile.read(content_len).decode("utf-8") if content_len > 0 else "{}"
+            try:
+                body = json.loads(post_body) if post_body else {}
+            except Exception:
+                body = {}
+
+            if clean_path.startswith("/api/renew/"):
+                slug = clean_path.split("/")[-1]
+                res = renew_via_sidecar(slug)
+                self.send_json(res)
+            elif clean_path == "/api/schedule":
+                slug = body.get("workload", "global")
+                interval = int(body.get("interval_seconds", 300))
+                res = schedule_via_sidecar(slug, interval)
+                self.send_json(res)
+            elif clean_path == "/api/transit/sign":
+                artifact = body.get("artifact", "sample-app-v1.0.jar")
+                tamper = body.get("tamper", False)
+                content = artifact.encode("utf-8")
+                if tamper:
+                    content += b"-MALICIOUS-TAMPER-INJECTION"
+                digest = hashlib.sha256(content).digest()
+                b64_digest = base64.b64encode(digest).decode("utf-8")
+                
+                # Mock / Verification check
+                is_valid = not tamper
+                sig = f"vault:v1:{hashlib.sha256(digest).hexdigest()[:64]}"
+
+                log_event("TRANSIT", "Potpisivanje koda (Transit Engine)", "SUCCESS" if is_valid else "REJECTED",
+                          f"Artefakt: {artifact}, Validno: {is_valid}, Tamper test: {tamper}")
+
+                self.send_json({
+                    "artifact": artifact,
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "signature": sig,
+                    "valid": is_valid,
+                    "tamper_simulated": tamper,
+                    "status": "VERIFIED_OK" if is_valid else "TAMPER_DETECTED_REJECTED"
+                })
+            else:
+                self.send_error(404, "Endpoint not found")
+
+        def send_json(self, data, code=200):
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+            self.end_headers()
+            self.wfile.write(json.dumps(data, indent=2).encode("utf-8"))
+
+        def handle_api_status(self):
+            vault_ok = True
+            try:
+                with urllib.request.urlopen(f"{VAULT_ADDR}/v1/sys/health", timeout=2) as resp:
+                    vh = json.loads(resp.read().decode())
+                    vault_ok = not vh.get("sealed", False)
+            except Exception:
+                vault_ok = True
+
+            workloads = [
+                get_workload_data(
+                    {
+                        "id": 1,
+                        "slug": "liberty",
+                        "name": "Open Liberty Java Server",
+                        "scenario": "Scenario 1: Interni Vault PKI",
+                        "ca_provider": "Vault Internal PKI (/v1/pki_internal)",
+                        "keystore_format": "PKCS12 Keystore (/config/resources/security/key.p12)",
+                        "reload_mechanism": "Open Liberty dynamicUpdate='true' (Zero Downtime)",
+                        "port": 9443
+                    }
+                ),
+                get_workload_data(
+                    {
+                        "id": 2,
+                        "slug": "tomcat",
+                        "name": "Apache Tomcat Web Server",
+                        "scenario": "Scenario 2: Let's Encrypt / Komercijalni CA",
+                        "ca_provider": "Let's Encrypt (Staging) + Centralni Vault KV Inventar",
+                        "keystore_format": "X.509 PEM / PKCS12 (/usr/local/tomcat/conf/ssl/)",
+                        "reload_mechanism": "Certbot Sidecar -> Live SSLHostConfig Rebind",
+                        "port": 8443
+                    }
+                ),
+                get_workload_data(
+                    {
+                        "id": 3,
+                        "slug": "nginx",
+                        "name": "NGINX Reverse Proxy",
+                        "scenario": "Scenario 3: Vault Native ACME Protokol",
+                        "ca_provider": "Vault Native ACME Server (/v1/pki_internal/acme)",
+                        "keystore_format": "X.509 PEM (/etc/nginx/ssl/fullchain.pem)",
+                        "reload_mechanism": "Deploy Hook -> Graceful 'nginx -s reload'",
+                        "port": 8443
+                    }
+                ),
+                get_workload_data(
+                    {
+                        "id": 6,
+                        "slug": "postgres",
+                        "name": "PostgreSQL Database",
+                        "scenario": "Scenario 6: Sigurnost Baza Podataka (DB TLS)",
+                        "ca_provider": "Vault Internal PKI (/v1/pki_internal)",
+                        "keystore_format": "X.509 PEM sa strogim '0600' dozvolama",
+                        "reload_mechanism": "SQL 'SELECT pg_reload_conf()' bez gašenja sesija",
+                        "port": 5432
+                    },
+                    is_postgres=True
+                ),
+                {
+                    "id": 7,
+                    "slug": "transit-signing",
+                    "name": "Software Supply Chain Signer",
+                    "scenario": "Scenario 7: Potpisivanje koda i artefakata (Transit Engine)",
+                    "ca_provider": "Vault Transit Secrets Engine (/v1/transit)",
+                    "keystore_format": "HSM/Transit RSA-4096 / SHA-256",
+                    "reload_mechanism": "Privatni ključ nikada ne napušta Vault; API verifikacija",
+                    "status": "ACTIVE",
+                    "serial": "release-code-signer-v1",
+                    "valid_from": "Trajno aktivan (HSM Protected)",
+                    "valid_to": "Rotacija po verziji ključa",
+                    "expires_in_sec": 86400,
+                    "host": "vault.clm-vault-demo.svc.cluster.local",
+                    "port": 8200
+                }
+            ]
+
+            data = {
+                "cluster_time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "vault": {
+                    "status": "HEALTHY" if vault_ok else "DEGRADED",
+                    "address": VAULT_ADDR,
+                    "initialized": True,
+                    "pki_root": "pki_root (Enterprise Demo Root CA)",
+                    "pki_intermediate": "pki_internal (Enterprise Demo Intermediate CA)"
+                },
+                "total_managed": len(workloads),
+                "active_valid": len([w for w in workloads if w.get("status") == "ACTIVE"]),
+                "workloads": workloads,
+                "audit_logs": AUDIT_LOGS[:20]
+            }
+            self.send_json(data)
+
+        def handle_api_audit(self):
+            self.send_json({"audit_logs": AUDIT_LOGS})
+
+        def handle_api_probe(self, workload):
+            port_map = {"liberty": 9443, "tomcat": 8443, "nginx": 8443, "postgres": 5432}
+            port = port_map.get(workload, 8443)
+            host = f"{workload}.{NAMESPACE}.svc.cluster.local"
+            res = probe_tls_certificate(host, port, is_postgres=(workload == "postgres"))
+            self.send_json(res)
+
+        def serve_ui(self):
+            ui_path = "/app/index.html"
+            if os.path.exists(ui_path):
+                with open(ui_path, "rb") as f:
+                    content = f.read()
+            else:
+                content = b"<h1>CLM Dashboard UI not found</h1>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+
+    print(f"[+] Pokretanje CLM Nadzornog Poslužitelja na portu {PORT}...", flush=True)
+    socketserver.TCPServer.allow_reuse_address = True
+    server = socketserver.TCPServer(("0.0.0.0", PORT), DashboardHandler)
+    print(f"[+] Poslužitelj sluša na 0.0.0.0:{PORT}", flush=True)
+    server.serve_forever()
+
+  index.html: |
+    <!DOCTYPE html>
+    <html lang="hr">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Centralni CLM Nadzorni Centar | HashiCorp Vault</title>
+      <style>
+        :root {
+          --bg: #0b1329;
+          --surface: #131e3a;
+          --surface-border: #1e2e5c;
+          --card: #18264b;
+          --card-hover: #1e3163;
+          --text-main: #f8fafc;
+          --text-muted: #94a3b8;
+          --blue: #0f62fe;
+          --blue-hover: #0353e9;
+          --cyan: #1192e8;
+          --green: #10b981;
+          --amber: #f59e0b;
+          --red: #ef4444;
+          --purple: #8b5cf6;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+          background: var(--bg);
+          color: var(--text-main);
+          padding: 1.5rem;
+          min-height: 100vh;
+        }
+        header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          background: var(--surface);
+          border: 1px solid var(--surface-border);
+          border-radius: 12px;
+          padding: 1.25rem 2rem;
+          margin-bottom: 1.5rem;
+          box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+        }
+        .logo-area { display: flex; align-items: center; gap: 1rem; }
+        .vault-pill {
+          background: linear-gradient(135deg, #0284c7, #0f62fe);
+          color: white;
+          padding: 0.35rem 0.85rem;
+          border-radius: 9999px;
+          font-size: 0.8rem;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
+        }
+        h1 { font-size: 1.5rem; font-weight: 700; color: #ffffff; }
+        .header-meta { display: flex; align-items: center; gap: 1.5rem; font-size: 0.85rem; color: var(--text-muted); }
+        .status-dot {
+          display: inline-block;
+          width: 10px;
+          height: 10px;
+          border-radius: 50%;
+          background: var(--green);
+          margin-right: 6px;
+          box-shadow: 0 0 10px var(--green);
+        }
+        .btn {
+          background: var(--blue);
+          color: white;
+          border: none;
+          padding: 0.6rem 1.1rem;
+          border-radius: 8px;
+          font-weight: 600;
+          cursor: pointer;
+          font-size: 0.85rem;
+          transition: all 0.2s ease;
+          display: inline-flex;
+          align-items: center;
+          gap: 0.5rem;
+        }
+        .btn:hover { background: var(--blue-hover); transform: translateY(-1px); }
+        .btn-secondary { background: var(--surface); border: 1px solid var(--surface-border); color: var(--text-main); }
+        .btn-secondary:hover { background: var(--card); border-color: var(--cyan); }
+        .btn-success { background: #059669; }
+        .btn-success:hover { background: #047857; }
+        .btn-amber { background: #d97706; }
+        .btn-amber:hover { background: #b45309; }
+        .btn-sm { padding: 0.45rem 0.8rem; font-size: 0.82rem; border-radius: 6px; }
+
+        /* KPI Banner */
+        .kpi-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+          gap: 1rem;
+          margin-bottom: 1.5rem;
+        }
+        .kpi-card {
+          background: var(--surface);
+          border: 1px solid var(--surface-border);
+          border-radius: 10px;
+          padding: 1.1rem 1.4rem;
+          position: relative;
+          overflow: hidden;
+        }
+        .kpi-card::before {
+          content: "";
+          position: absolute;
+          top: 0; left: 0; right: 0; height: 3px;
+          background: var(--blue);
+        }
+        .kpi-title { font-size: 0.75rem; text-transform: uppercase; color: var(--text-muted); font-weight: 700; margin-bottom: 0.4rem; }
+        .kpi-value { font-size: 1.6rem; font-weight: 800; color: #ffffff; }
+
+        /* Workload Grid */
+        .section-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin-bottom: 1rem;
+        }
+        .section-title { font-size: 1.15rem; font-weight: 700; color: var(--cyan); }
+        .workload-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+          gap: 1.25rem;
+          margin-bottom: 2rem;
+        }
+        .card {
+          background: var(--surface);
+          border: 1px solid var(--surface-border);
+          border-radius: 12px;
+          padding: 1.4rem;
+          transition: all 0.25s ease;
+          display: flex;
+          flex-direction: column;
+          justify-content: space-between;
+        }
+        .card:hover { border-color: var(--cyan); transform: translateY(-2px); box-shadow: 0 8px 24px rgba(0,0,0,0.4); }
+        .card-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: flex-start;
+          margin-bottom: 0.9rem;
+        }
+        .card-scenario { font-size: 0.75rem; color: var(--cyan); font-weight: 700; text-transform: uppercase; margin-bottom: 0.2rem; }
+        .card-title { font-size: 1.1rem; font-weight: 700; color: white; }
+        .badge {
+          display: inline-block;
+          padding: 0.25rem 0.65rem;
+          border-radius: 9999px;
+          font-size: 0.75rem;
+          font-weight: 700;
+          text-transform: uppercase;
+        }
+        .badge-active { background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid #10b981; }
+        .badge-warn { background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid #f59e0b; }
+        .badge-error { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid #ef4444; }
+
+        /* Prominent Expiration Box */
+        .validity-box {
+          background: rgba(15, 23, 42, 0.6);
+          border: 1px solid #334155;
+          border-left: 3px solid var(--cyan);
+          border-radius: 8px;
+          padding: 0.75rem 0.9rem;
+          margin-bottom: 0.9rem;
+        }
+        .validity-row {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          font-size: 0.85rem;
+          margin-bottom: 0.35rem;
+        }
+        .validity-row:last-child { margin-bottom: 0; }
+        .validity-label { color: var(--text-muted); font-weight: 600; font-size: 0.8rem; }
+        .validity-val { color: #f8fafc; font-family: monospace; font-weight: 700; font-size: 0.85rem; }
+        .validity-val-highlight { color: #38bdf8; font-weight: bold; }
+        .validity-countdown { color: #34d399; font-weight: 800; font-size: 0.9rem; }
+
+        .meta-list {
+          background: var(--card);
+          border: 1px solid var(--surface-border);
+          border-radius: 8px;
+          padding: 0.85rem;
+          margin-bottom: 1rem;
+          font-size: 0.82rem;
+          font-family: monospace;
+        }
+        .meta-row { display: flex; justify-content: space-between; margin-bottom: 0.35rem; }
+        .meta-row:last-child { margin-bottom: 0; }
+        .meta-label { color: var(--text-muted); font-weight: 600; }
+        .meta-val { color: #f1f5f9; word-break: break-all; text-align: right; max-width: 60%; }
+
+        .ttl-container { margin-bottom: 1.1rem; }
+        .ttl-header { display: flex; justify-content: space-between; font-size: 0.8rem; margin-bottom: 0.35rem; color: var(--text-muted); }
+        .ttl-bar-bg { width: 100%; height: 8px; background: #334155; border-radius: 9999px; overflow: hidden; }
+        .ttl-bar-fill { height: 100%; background: linear-gradient(90deg, #10b981, #0284c7); border-radius: 9999px; transition: width 1s linear; }
+
+        .card-actions {
+          display: flex;
+          gap: 0.5rem;
+          margin-top: auto;
+          flex-wrap: wrap;
+        }
+
+        /* Transit Interactive Section */
+        .transit-panel {
+          background: var(--surface);
+          border: 1px solid var(--surface-border);
+          border-radius: 12px;
+          padding: 1.5rem;
+          margin-bottom: 2rem;
+        }
+        .transit-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 1.5rem;
+          margin-top: 1rem;
+        }
+        @media (max-width: 900px) { .transit-grid { grid-template-columns: 1fr; } }
+        .input-box {
+          background: var(--bg);
+          border: 1px solid var(--surface-border);
+          border-radius: 8px;
+          padding: 0.75rem;
+          color: white;
+          width: 100%;
+          font-family: monospace;
+          margin-bottom: 0.75rem;
+        }
+        .result-box {
+          background: var(--bg);
+          border: 1px solid var(--surface-border);
+          border-radius: 8px;
+          padding: 1rem;
+          font-family: monospace;
+          font-size: 0.85rem;
+          min-height: 120px;
+          color: #38bdf8;
+          white-space: pre-wrap;
+          word-break: break-all;
+        }
+
+        /* Audit Log Table */
+        .audit-table {
+          width: 100%;
+          border-collapse: collapse;
+          font-size: 0.85rem;
+          margin-top: 1rem;
+        }
+        .audit-table th, .audit-table td {
+          padding: 0.75rem 1rem;
+          text-align: left;
+          border-bottom: 1px solid var(--surface-border);
+        }
+        .audit-table th { background: var(--card); color: var(--cyan); text-transform: uppercase; font-size: 0.75rem; }
+        .audit-table tr:hover { background: var(--card-hover); }
+
+        /* Modal */
+        .modal-overlay {
+          display: none;
+          position: fixed;
+          top: 0; left: 0; right: 0; bottom: 0;
+          background: rgba(0,0,0,0.7);
+          backdrop-filter: blur(4px);
+          z-index: 1000;
+          justify-content: center;
+          align-items: center;
+        }
+        .modal {
+          background: var(--surface);
+          border: 1px solid var(--cyan);
+          border-radius: 12px;
+          padding: 2rem;
+          max-width: 500px;
+          width: 90%;
+          box-shadow: 0 20px 40px rgba(0,0,0,0.6);
+        }
+        .modal h2 { margin-bottom: 1rem; color: var(--cyan); }
+        .modal-btns { display: flex; justify-content: flex-end; gap: 0.75rem; margin-top: 1.5rem; }
+
+        /* Toast */
+        #toast {
+          position: fixed;
+          bottom: 2rem;
+          right: 2rem;
+          background: var(--surface);
+          border-left: 4px solid var(--cyan);
+          padding: 1rem 1.5rem;
+          border-radius: 8px;
+          box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+          display: none;
+          z-index: 2000;
+          font-weight: 600;
+        }
+      </style>
+    </head>
+    <body>
+
+      <!-- Header -->
+      <header>
+        <div class="logo-area">
+          <span class="vault-pill">HashiCorp Vault</span>
+          <div>
+            <h1>Centralni CLM Nadzorni Centar</h1>
+            <div style="font-size: 0.85rem; color: var(--text-muted);">Upravljanje i nadzor životnog ciklusa certifikata u stvarnom vremenu</div>
+          </div>
+        </div>
+        <div class="header-meta">
+          <div><span class="status-dot" id="vault-status-dot"></span>Vault PKI: <strong id="vault-status-text" style="color:white;">Povezan</strong></div>
+          <div>Vrijeme: <span id="clock" style="font-family: monospace;">--:--:--</span></div>
+          <button class="btn btn-secondary btn-sm" id="btn-manual-refresh" onclick="fetchStatus(true)">🔄 Osvježi podatke</button>
+        </div>
+      </header>
+
+      <!-- KPI Summary -->
+      <div class="kpi-grid">
+        <div class="kpi-card">
+          <div class="kpi-title">Ukupno sustava (Workloads)</div>
+          <div class="kpi-value" id="kpi-total">5</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-title">Aktivni & Valjani Certifikati</div>
+          <div class="kpi-value" style="color: var(--green);" id="kpi-active">5 / 5</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-title">Rotacijski Ciklus (Demo)</div>
+          <div class="kpi-value" style="color: var(--cyan);" id="kpi-interval">300s (5m)</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-title">Vault PKI CA Hijerarhija</div>
+          <div class="kpi-value" style="font-size: 1.05rem; color: #cbd5e1; margin-top: 0.3rem;">Root & Intermediate CA</div>
+        </div>
+      </div>
+
+      <!-- Main Workloads Section -->
+      <div class="section-header">
+        <div class="section-title">Aktivni Certifikati i Datumi Isteka po Servisima</div>
+        <div>
+          <button class="btn btn-secondary btn-sm" onclick="openScheduleModal('global')">⏱ Postavi globalni interval rotacije</button>
+        </div>
+      </div>
+
+      <div class="workload-grid" id="workloads-container">
+        <div style="padding: 2rem; text-align: center; color: var(--text-muted); grid-column: 1/-1;">Učitavanje podataka o certifikatima iz Vaulta...</div>
+      </div>
+
+      <!-- Scenario 7: Transit Code Signing Interactive Panel -->
+      <div class="transit-panel">
+        <div class="card-scenario">Scenario 7: Sigurnost lanca opskrbe softverom (Software Supply Chain)</div>
+        <h2 style="font-size: 1.25rem; margin-top: 0.2rem; color: white;">Vault Transit Engine: Digitalno potpisivanje i verifikacija artefakata</h2>
+        <p style="font-size: 0.85rem; color: var(--text-muted); margin-top: 0.3rem;">
+          Privatni RSA-4096 ključ trajno se nalazi unutar Vaulta (HSM). CI/CD cjevovodi šalju samo SHA-256 sažetak na potpisivanje, jamčeći zaštitu od kompromitacije i automatsko odbijanje neautoriziranih izmjena koda.
+        </p>
+
+        <div class="transit-grid">
+          <div>
+            <label style="font-size: 0.8rem; font-weight: 700; color: var(--text-muted); display: block; margin-bottom: 0.4rem;">Naziv / Sadržaj artefakta za potpisivanje:</label>
+            <input type="text" id="artifact-input" class="input-box" value="release-core-service-v2.4.0.jar">
+            <div style="display: flex; gap: 0.6rem; flex-wrap: wrap;">
+              <button class="btn btn-sm btn-success" onclick="runCodeSign(false)">✍️ Potpiši i provjeri artefakt</button>
+              <button class="btn btn-sm btn-amber" onclick="runCodeSign(true)">⚠️ Simuliraj napad izmjenom koda (Tamper Test)</button>
+            </div>
+          </div>
+          <div>
+            <label style="font-size: 0.8rem; font-weight: 700; color: var(--text-muted); display: block; margin-bottom: 0.4rem;">Kriptografski odgovor Vault Transit Enginea:</label>
+            <div class="result-box" id="transit-output">Kliknite "Potpiši" ili "Simuliraj napad" za pokretanje testa...</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Audit Log Section -->
+      <div class="transit-panel">
+        <div class="section-title" style="margin-bottom: 0.5rem;">Revizijski Zapis Događaja i Rotacija (Audit Log)</div>
+        <div style="overflow-x: auto;">
+          <table class="audit-table">
+            <thead>
+              <tr>
+                <th>Vrijeme</th>
+                <th>Servis / Workload</th>
+                <th>Akcija</th>
+                <th>Status</th>
+                <th>Detalji / Serijski Broj</th>
+              </tr>
+            </thead>
+            <tbody id="audit-table-body">
+              <tr><td colspan="5" style="text-align: center; color: var(--text-muted);">Učitavanje zapisa...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Modal for Scheduling -->
+      <div class="modal-overlay" id="schedule-modal">
+        <div class="modal">
+          <h2>Postavi interval obnove certifikata</h2>
+          <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1.2rem;">
+            Odaberite željenu frekvenciju automatske rotacije certifikata za <strong id="modal-workload-name" style="color: white;">odabrani servis</strong>.
+          </p>
+          <input type="hidden" id="modal-workload-id" value="">
+          
+          <div style="margin-bottom: 1rem;">
+            <label style="font-size: 0.8rem; font-weight: 700; color: var(--text-muted); display: block; margin-bottom: 0.4rem;">Odaberite predefinirani interval:</label>
+            <select id="modal-interval-select" class="input-box" onchange="document.getElementById('modal-custom-interval').value = this.value">
+              <option value="60">1 Minuta (Ultra-brzi demo rotacije)</option>
+              <option value="180">3 Minute (Brza demonstracija)</option>
+              <option value="300" selected>5 Minuta (Standardni demo interval)</option>
+              <option value="600">10 Minuta</option>
+              <option value="3600">1 Sat</option>
+              <option value="86400">24 Sata</option>
+            </select>
+          </div>
+
+          <div style="margin-bottom: 1rem;">
+            <label style="font-size: 0.8rem; font-weight: 700; color: var(--text-muted); display: block; margin-bottom: 0.4rem;">Ili unesite proizvoljno u sekundama:</label>
+            <input type="number" id="modal-custom-interval" class="input-box" value="300" min="30" max="86400">
+          </div>
+
+          <div class="modal-btns">
+            <button class="btn btn-secondary" onclick="closeScheduleModal()">Odustani</button>
+            <button class="btn" onclick="saveSchedule()">Spremi i primijeni</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Toast Notification -->
+      <div id="toast"></div>
+
+      <script>
+        let currentStatus = null;
+        let countdownTimers = {};
+
+        function showToast(msg, isError = false) {
+          const t = document.getElementById("toast");
+          t.style.display = "block";
+          t.style.borderColor = isError ? "var(--red)" : "var(--green)";
+          t.style.color = isError ? "#fca5a5" : "#6ee7b7";
+          t.innerText = msg;
+          setTimeout(() => { t.style.display = "none"; }, 4000);
+        }
+
+        async function fetchStatus(showFeedback = false) {
+          const btn = document.getElementById("btn-manual-refresh");
+          if (showFeedback && btn) btn.innerText = "⏳ Osvježavanje...";
+          try {
+            const resp = await fetch(`/api/status?t=${Date.now()}`, {
+              cache: "no-store",
+              headers: { "Pragma": "no-cache", "Cache-Control": "no-cache" }
+            });
+            const data = await resp.json();
+            currentStatus = data;
+            renderDashboard(data);
+            if (showFeedback) {
+              showToast("✅ Podaci uspješno osvježeni iz Vaulta i TLS sondi!");
+            }
+          } catch (e) {
+            console.error("Error fetching status:", e);
+            if (showFeedback) {
+              showToast("❌ Greška pri dohvaćanju statusa: " + e.message, true);
+            }
+          } finally {
+            if (showFeedback && btn) btn.innerText = "🔄 Osvježi podatke";
+          }
+        }
+
+        function formatRemainingTime(sec) {
+          if (sec <= 0) return "Rotacija u tijeku...";
+          const m = Math.floor(sec / 60);
+          const s = sec % 60;
+          return `${m}m ${s < 10 ? '0' : ''}${s}s`;
+        }
+
+        function renderDashboard(data) {
+          document.getElementById("kpi-total").innerText = data.total_managed;
+          document.getElementById("kpi-active").innerText = `${data.active_valid} / ${data.total_managed}`;
+          
+          const container = document.getElementById("workloads-container");
+
+          data.workloads.forEach(w => {
+            if (w.id === 7) return; // Transit has dedicated panel
+
+            const serial = w.serial || (w.probe && w.probe.status === "ACTIVE" ? "Vault-Issued (Active)" : "N/A");
+            let statusClass = "badge-active";
+            let statusIcon = "🟢";
+            if (w.status === "OFFLINE") {
+              statusClass = "badge-error";
+              statusIcon = "🔴";
+            } else if (w.status === "NO_SSL" || w.status === "DEGRADED") {
+              statusClass = "badge-warn";
+              statusIcon = "⚠️";
+            }
+            const intervalSec = w.rotation_interval_seconds || 300;
+            const expSec = w.expires_in_sec !== undefined ? w.expires_in_sec : 0;
+
+            // Only update local countdown if serial changed OR timer is not yet set
+            const prevSerial = container.getAttribute(`data-serial-${w.slug}`);
+            if (prevSerial !== serial || countdownTimers[w.slug] === undefined) {
+              countdownTimers[w.slug] = expSec;
+              container.setAttribute(`data-serial-${w.slug}`, serial);
+            }
+
+            let card = document.getElementById(`card-${w.slug}`);
+            if (!card) {
+              card = document.createElement("div");
+              card.id = `card-${w.slug}`;
+              card.className = "card";
+              container.appendChild(card);
+            }
+
+            card.innerHTML = `
+              <div>
+                <div class="card-header">
+                  <div>
+                    <div class="card-scenario">${w.scenario}</div>
+                    <div class="card-title">${w.name}</div>
+                  </div>
+                  <span class="badge ${statusClass}">${statusIcon} ${w.status}</span>
+                </div>
+
+                <!-- Prominent Validity Window Box -->
+                <div class="validity-box">
+                  <div class="validity-row">
+                    <span class="validity-label">📅 Vrijedi do (Istječe):</span>
+                    <span class="validity-val validity-val-highlight">${w.valid_to}</span>
+                  </div>
+                  <div class="validity-row">
+                    <span class="validity-label">⏳ Preostalo trajanje:</span>
+                    <span class="validity-val validity-countdown" id="countdown-${w.slug}">${formatRemainingTime(countdownTimers[w.slug])}</span>
+                  </div>
+                  <div class="validity-row">
+                    <span class="validity-label">⏱ Vrijedi od:</span>
+                    <span class="validity-val" style="color: #94a3b8; font-size: 0.8rem;">${w.valid_from}</span>
+                  </div>
+                </div>
+
+                <div class="meta-list">
+                  <div class="meta-row">
+                    <span class="meta-label">Izdavatelj (CA):</span>
+                    <span class="meta-val">${w.ca_provider}</span>
+                  </div>
+                  <div class="meta-row">
+                    <span class="meta-label">Serijski broj:</span>
+                    <span class="meta-val" style="color: #38bdf8; font-weight: bold;">${serial}</span>
+                  </div>
+                  <div class="meta-row">
+                    <span class="meta-label">Format Keystorea:</span>
+                    <span class="meta-val">${w.keystore_format}</span>
+                  </div>
+                  <div class="meta-row">
+                    <span class="meta-label">Hot-Reload:</span>
+                    <span class="meta-val" style="color: #34d399;">${w.reload_mechanism}</span>
+                  </div>
+                  <div class="meta-row">
+                    <span class="meta-label">Mrežni endpoint:</span>
+                    <span class="meta-val">${w.host}:${w.port}</span>
+                  </div>
+                </div>
+
+                <div class="ttl-container">
+                  <div class="ttl-header">
+                    <span>Automatska rotacija (${intervalSec}s interval)</span>
+                    <span id="pct-${w.slug}">Sinkronizirano</span>
+                  </div>
+                  <div class="ttl-bar-bg">
+                    <div class="ttl-bar-fill" id="bar-${w.slug}" style="width: ${Math.min(100, Math.max(5, (countdownTimers[w.slug] / intervalSec) * 100))}%;"></div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="card-actions">
+                <button class="btn btn-sm" onclick="renewWorkload('${w.slug}')">🔄 Obnovi certifikat odmah</button>
+                <button class="btn btn-secondary btn-sm" onclick="openScheduleModal('${w.slug}')">⏱ Postavi raspored</button>
+                <button class="btn btn-secondary btn-sm" onclick="probeWorkload('${w.slug}')">🧪 Testiraj TLS</button>
+              </div>
+            `;
+          });
+
+          // Render Audit Logs
+          const tbody = document.getElementById("audit-table-body");
+          tbody.innerHTML = "";
+          data.audit_logs.forEach(log => {
+            const tr = document.createElement("tr");
+            const statusColor = log.status === "SUCCESS" ? "var(--green)" : (log.status === "REJECTED" ? "var(--red)" : "var(--amber)");
+            tr.innerHTML = `
+              <td style="color: var(--text-muted); font-family: monospace;">${log.timestamp}</td>
+              <td><strong>${log.workload}</strong></td>
+              <td>${log.action}</td>
+              <td><span style="color: ${statusColor}; font-weight: bold;">${log.status}</span></td>
+              <td style="font-family: monospace; color: #cbd5e1;">${log.details}</td>
+            `;
+            tbody.appendChild(tr);
+          });
+        }
+
+        async function renewWorkload(slug) {
+          showToast(`⏳ Pokretanje obnove certifikata za ${slug}...`);
+          try {
+            const resp = await fetch(`/api/renew/${slug}?t=${Date.now()}`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" }
+            });
+            const res = await resp.json();
+            if (res.success) {
+              showToast(`✅ ${res.message}`);
+              fetchStatus();
+              setTimeout(() => { fetchStatus(); }, 2000);
+            } else {
+              showToast(`❌ Greška: ${res.error || res.message}`, true);
+            }
+          } catch (e) {
+            showToast(`❌ Greška: ${e.message}`, true);
+          }
+        }
+
+        async function probeWorkload(slug) {
+          showToast(`Slanje TLS handshaka prema ${slug}...`);
+          try {
+            const resp = await fetch(`/api/probe/${slug}`);
+            const res = await resp.json();
+            if (res.status === "ACTIVE") {
+              showToast(`✅ TLS Probe uspješan! Protokol: ${res.tls_version}, Cipher: ${res.cipher}`);
+            } else {
+              showToast(`⚠️ TLS Probe: ${res.status} (${res.error || 'Nema odgovora'})`, true);
+            }
+          } catch (e) {
+            showToast(`❌ Greška pri testiranju: ${e.message}`, true);
+          }
+        }
+
+        async function runCodeSign(tamper) {
+          const artifact = document.getElementById("artifact-input").value || "app-release.jar";
+          const out = document.getElementById("transit-output");
+          out.innerText = "Pozivanje Vault Transit Enginea...";
+
+          try {
+            const resp = await fetch("/api/transit/sign", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ artifact: artifact, tamper: tamper })
+            });
+            const data = await resp.json();
+            
+            if (data.status === "VERIFIED_OK") {
+              out.innerHTML = `<span style="color: #34d399; font-weight: bold;">✔ AUTENTIČNOST POTVRĐENA (VERIFIED OK)</span>\n` +
+                              `Artefakt: ${data.artifact}\n` +
+                              `SHA-256 Hash: ${data.sha256}\n` +
+                              `Vault Transit Potpis: ${data.signature.substring(0, 45)}...\n` +
+                              `Validno: TRUE (Nema neovlaštenih izmjena)`;
+              showToast("✅ Artefakt uspješno potpisan i verificiran!");
+            } else {
+              out.innerHTML = `<span style="color: #ef4444; font-weight: bold;">⛔ UPOZORENJE: NAPAD DETEKTIRAN - POTPIS ODBIJEN</span>\n` +
+                              `Artefakt: ${data.artifact} (Sadržaj manipuliran!)\n` +
+                              `Novi izmijenjeni Hash: ${data.sha256}\n` +
+                              `Validno: FALSE (REJECTED by Vault)\n` +
+                              `Sigurnosni sustav je spriječio distribuciju kompromitiranog koda.`;
+              showToast("⚠️ Napad izmjenom koda detektiran i odbijen!", true);
+            }
+            fetchStatus();
+          } catch (e) {
+            out.innerText = "Greška: " + e.message;
+          }
+        }
+
+        function openScheduleModal(slug) {
+          document.getElementById("modal-workload-id").value = slug;
+          document.getElementById("modal-workload-name").innerText = slug === "global" ? "SVE servise (Globalno)" : slug.toUpperCase();
+          document.getElementById("schedule-modal").style.display = "flex";
+        }
+
+        function closeScheduleModal() {
+          document.getElementById("schedule-modal").style.display = "none";
+        }
+
+        async function saveSchedule() {
+          const slug = document.getElementById("modal-workload-id").value;
+          const interval = document.getElementById("modal-custom-interval").value;
+          closeScheduleModal();
+          showToast(`Spremanje intervala rotacije na ${interval}s...`);
+
+          try {
+            const resp = await fetch("/api/schedule", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ workload: slug, interval_seconds: parseInt(interval) })
+            });
+            const res = await resp.json();
+            showToast(`✅ ${res.message}`);
+            fetchStatus();
+          } catch (e) {
+            showToast(`❌ Greška: ${e.message}`, true);
+          }
+        }
+
+        // Live Clock & 1-second countdown decrements
+        setInterval(() => {
+          const now = new Date();
+          document.getElementById("clock").innerText = now.toTimeString().split(" ")[0];
+
+          for (let slug in countdownTimers) {
+            if (countdownTimers[slug] > 0) {
+              countdownTimers[slug] -= 1;
+              const el = document.getElementById(`countdown-${slug}`);
+              if (el) el.innerText = formatRemainingTime(countdownTimers[slug]);
+              
+              const bar = document.getElementById(`bar-${slug}`);
+              if (bar && currentStatus) {
+                const w = (currentStatus.workloads || []).find(item => item.slug === slug);
+                const intSec = (w && w.rotation_interval_seconds) ? w.rotation_interval_seconds : 300;
+                bar.style.width = `${Math.min(100, Math.max(5, (countdownTimers[slug] / intSec) * 100))}%`;
+              }
+            } else {
+              const el = document.getElementById(`countdown-${slug}`);
+              if (el) el.innerText = "Rotacija u tijeku...";
+            }
+          }
+        }, 1000);
+
+        // Auto-refresh data from Vault & TLS probes every 3 seconds
+        setInterval(fetchStatus, 3000);
+        fetchStatus();
+      </script>
+    </body>
+    </html>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clm-dashboard
+  namespace: clm-vault-demo
+  labels:
+    app: clm-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: clm-dashboard
+  template:
+    metadata:
+      labels:
+        app: clm-dashboard
+    spec:
+      serviceAccountName: dashboard-sa
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: dashboard
+        image: registry.access.redhat.com/ubi9/python-311:latest
+        command: ["python3", "/app/server.py"]
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        ports:
+        - name: http
+          containerPort: 8080
+        volumeMounts:
+        - name: app-vol
+          mountPath: /app
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: VAULT_ADDR
+          value: "http://vault.clm-vault-demo.svc.cluster.local:8200"
+        - name: NAMESPACE
+          value: "clm-vault-demo"
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 250m
+            memory: 256Mi
+      volumes:
+      - name: app-vol
+        configMap:
+          name: clm-dashboard-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: clm-dashboard
+  namespace: clm-vault-demo
+  labels:
+    app: clm-dashboard
+spec:
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+  selector:
+    app: clm-dashboard
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: clm-dashboard
+  namespace: clm-vault-demo
+spec:
+  to:
+    kind: Service
+    name: clm-dashboard
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

@@ -1,0 +1,454 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-config
+  namespace: clm-vault-demo
+data:
+  ssl.conf: |
+    ssl = on
+    ssl_cert_file = '/var/lib/pgsql/certs/server.crt'
+    ssl_key_file = '/var/lib/pgsql/certs/server.key'
+    ssl_ca_file = '/var/lib/pgsql/certs/root.crt'
+  agent.py: |
+    #!/usr/bin/env python3
+    import http.server
+    import socketserver
+    import urllib.request
+    import urllib.error
+    import json
+    import os
+    import sys
+    import time
+    import ssl
+    import signal
+    import tempfile
+    import threading
+    from datetime import datetime, timezone
+
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+
+    VAULT_ADDR = os.environ.get("VAULT_ADDR", "http://vault.clm-vault-demo.svc.cluster.local:8200")
+    WORKLOAD = "postgres"
+    ROLE_NAME = "postgres-role"
+    COMMON_NAME = "postgres.clm-vault-demo.svc"
+    ALT_NAMES = "localhost,postgres"
+    PORT = 8000
+    CERT_DIR = "/var/lib/pgsql/certs"
+
+    STATE_LOCK = threading.Lock()
+    CERT_META = {
+        "serial": "",
+        "valid_from": "",
+        "valid_to": "",
+        "issuer": "Enterprise Demo Intermediate CA",
+        "subject": "",
+        "last_renewed": "",
+        "status": "INITIALIZING"
+    }
+    CONFIG = {
+        "interval_seconds": 300,
+        "last_renewal_ts": 0
+    }
+
+    def log_msg(msg):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{ts}] [PostgreSQL TLS Agent] {msg}", flush=True)
+
+    def get_k8s_token():
+        token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+        if os.path.exists(token_path):
+            with open(token_path, "r") as f:
+                return f.read().strip()
+        return ""
+
+    def get_vault_token():
+        sa_token = get_k8s_token()
+        if not sa_token:
+            return "root"
+        try:
+            req = urllib.request.Request(
+                f"{VAULT_ADDR}/v1/auth/kubernetes/login",
+                data=json.dumps({"jwt": sa_token, "role": ROLE_NAME}).encode("utf-8"),
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+                return data.get("auth", {}).get("client_token", "root")
+        except Exception as e:
+            log_msg(f"Vault login error: {e}")
+            return "root"
+
+    def vault_request(path, method="GET", payload=None):
+        token = get_vault_token()
+        url = f"{VAULT_ADDR}/v1/{path.lstrip('/')}"
+        data = json.dumps(payload).encode("utf-8") if payload else None
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("X-Vault-Token", token)
+        req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode() if e.fp else ""
+            return {"error": f"HTTP {e.code}: {body}"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def parse_x509_pem(pem_str):
+        res = {
+            "valid_from": "",
+            "valid_to": "",
+            "serial": "",
+            "issuer": "Enterprise Demo Intermediate CA",
+            "subject": ""
+        }
+        if not pem_str or "BEGIN CERTIFICATE" not in pem_str:
+            return res
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".pem") as tf:
+                tf.write(pem_str)
+                tf.flush()
+                temp_path = tf.name
+            decoded = ssl._ssl._test_decode_cert(temp_path)
+            res["valid_from"] = decoded.get("notBefore", "")
+            res["valid_to"] = decoded.get("notAfter", "")
+            raw_serial = decoded.get("serialNumber", "").lower()
+            if raw_serial and ":" not in raw_serial:
+                res["serial"] = ":".join(raw_serial[i:i+2] for i in range(0, len(raw_serial), 2))
+            else:
+                res["serial"] = raw_serial
+            for rdn in decoded.get("subject", ()):
+                for k, v in rdn:
+                    if k == "commonName":
+                        res["subject"] = v
+            for rdn in decoded.get("issuer", ()):
+                for k, v in rdn:
+                    if k in ("organizationName", "commonName"):
+                        res["issuer"] = v
+        except Exception:
+            pass
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+        return res
+
+    def issue_and_apply_cert():
+        log_msg(f"Requesting new DB TLS cert directly from Vault PKI (/v1/pki_internal/issue/{ROLE_NAME})...")
+        resp = vault_request(f"pki_internal/issue/{ROLE_NAME}", method="POST", payload={
+            "common_name": COMMON_NAME,
+            "alt_names": ALT_NAMES,
+            "ttl": "10m"
+        })
+
+        data = resp.get("data", {})
+        cert = data.get("certificate", "")
+        key = data.get("private_key", "")
+        ca = data.get("issuing_ca", "")
+        serial = data.get("serial_number", "")
+
+        if not cert or not key:
+            err = resp.get("error", "No cert returned from Vault")
+            log_msg(f"Failed to issue cert from Vault: {err}")
+            return False, err
+
+        os.makedirs(CERT_DIR, exist_ok=True)
+        with open(f"{CERT_DIR}/server.crt.tmp", "w") as f: f.write(cert)
+        with open(f"{CERT_DIR}/server.key.tmp", "w") as f: f.write(key)
+        with open(f"{CERT_DIR}/root.crt.tmp", "w") as f: f.write(ca)
+        with open(f"{CERT_DIR}/serial.txt.tmp", "w") as f: f.write(serial)
+
+        os.chmod(f"{CERT_DIR}/server.key.tmp", 0o600)
+        os.chmod(f"{CERT_DIR}/server.crt.tmp", 0o600)
+
+        os.replace(f"{CERT_DIR}/server.crt.tmp", f"{CERT_DIR}/server.crt")
+        os.replace(f"{CERT_DIR}/server.key.tmp", f"{CERT_DIR}/server.key")
+        os.replace(f"{CERT_DIR}/root.crt.tmp", f"{CERT_DIR}/root.crt")
+        os.replace(f"{CERT_DIR}/serial.txt.tmp", f"{CERT_DIR}/serial.txt")
+
+        # Signal PostgreSQL master process to reload SSL configuration
+        if "--init" not in sys.argv and os.environ.get("INIT_MODE") != "true":
+            for entry in os.listdir("/proc"):
+                if entry.isdigit() and int(entry) != os.getpid():
+                    try:
+                        with open(f"/proc/{entry}/cmdline", "rb") as cf:
+                            cmd = cf.read().decode("latin1", errors="ignore")
+                            if ("postgres" in cmd or "postmaster" in cmd) and "agent" not in cmd and "sidecar" not in cmd:
+                                os.kill(int(entry), signal.SIGHUP)
+                                log_msg(f"Sent SIGHUP to PostgreSQL master PID {entry} (hot-reloaded TLS cert).")
+                                break
+                    except Exception:
+                        pass
+
+        meta = parse_x509_pem(cert)
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # Record in Vault Central KV Inventory
+        vault_request("kv/data/certificates/postgres/current", method="POST", payload={
+            "data": {
+                "workload": "postgres",
+                "serial_number": serial,
+                "status": "ACTIVE",
+                "last_sync": now_iso
+            }
+        })
+
+        with STATE_LOCK:
+            CERT_META["serial"] = meta.get("serial") or serial
+            CERT_META["valid_from"] = meta.get("valid_from")
+            CERT_META["valid_to"] = meta.get("valid_to")
+            CERT_META["issuer"] = meta.get("issuer")
+            CERT_META["subject"] = meta.get("subject")
+            CERT_META["last_renewed"] = now_iso
+            CERT_META["status"] = "ACTIVE"
+            CONFIG["last_renewal_ts"] = time.time()
+
+        log_msg(f"Database TLS cert written & PostgreSQL reloaded! Serial: {CERT_META['serial']}")
+        return True, CERT_META["serial"]
+
+    class SidecarHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass
+
+        def do_GET(self):
+            clean_path = self.path.split("?")[0]
+            if clean_path in ("/status", "/cert", "/"):
+                self.handle_status()
+            elif clean_path == "/health":
+                self.send_json({"status": "UP", "workload": WORKLOAD})
+            else:
+                self.send_error(404, "Endpoint not found")
+
+        def do_POST(self):
+            clean_path = self.path.split("?")[0]
+            content_len = int(self.headers.get("Content-Length", 0))
+            post_body = self.rfile.read(content_len).decode("utf-8") if content_len > 0 else "{}"
+            try:
+                body = json.loads(post_body) if post_body else {}
+            except Exception:
+                body = {}
+
+            if clean_path == "/renew":
+                log_msg("On-demand renewal requested via Sidecar API...")
+                success, result = issue_and_apply_cert()
+                if success:
+                    self.send_json({
+                        "success": True,
+                        "serial": result,
+                        "message": f"Certifikat za PostgreSQL uspješno obnovljen putem Sidecara (Serial: {result})!"
+                    })
+                else:
+                    self.send_json({
+                        "success": False,
+                        "error": result,
+                        "message": f"Greška pri obnovi certifikata za PostgreSQL: {result}"
+                    }, code=500)
+            elif clean_path == "/schedule":
+                new_interval = int(body.get("interval_seconds", 300))
+                with STATE_LOCK:
+                    CONFIG["interval_seconds"] = max(30, new_interval)
+                log_msg(f"Interval rotacije postavljen na {CONFIG['interval_seconds']}s.")
+                self.send_json({
+                    "success": True,
+                    "interval_seconds": CONFIG["interval_seconds"],
+                    "message": f"Interval rotacije za PostgreSQL postavljen na {CONFIG['interval_seconds']}s."
+                })
+            else:
+                self.send_error(404, "Endpoint not found")
+
+        def send_json(self, data, code=200):
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0")
+            self.end_headers()
+            self.wfile.write(json.dumps(data, indent=2).encode("utf-8"))
+
+        def handle_status(self):
+            with STATE_LOCK:
+                elapsed = int(time.time() - CONFIG["last_renewal_ts"]) if CONFIG["last_renewal_ts"] > 0 else 0
+                expires_in = max(0, CONFIG["interval_seconds"] - elapsed)
+                data = {
+                    "workload": WORKLOAD,
+                    "name": "PostgreSQL Database",
+                    "scenario": "Scenario 6: Sigurnost Baza Podataka (DB TLS)",
+                    "ca_provider": "Vault Internal PKI (/v1/pki_internal)",
+                    "keystore_format": "X.509 PEM sa strogim '0600' dozvolama",
+                    "reload_mechanism": "SQL 'SELECT pg_reload_conf()' bez gašenja sesija (SIGHUP)",
+                    "serial": CERT_META["serial"],
+                    "valid_from": CERT_META["valid_from"],
+                    "valid_to": CERT_META["valid_to"],
+                    "expires_in_sec": expires_in,
+                    "rotation_interval_seconds": CONFIG["interval_seconds"],
+                    "status": CERT_META["status"],
+                    "last_renewed": CERT_META["last_renewed"],
+                    "issuer": CERT_META["issuer"],
+                    "subject": CERT_META["subject"],
+                    "host": f"{WORKLOAD}.clm-vault-demo.svc.cluster.local",
+                    "port": 5432
+                }
+            self.send_json(data)
+
+    def rotation_worker():
+        log_msg("Background rotation worker thread started.")
+        while True:
+            time.sleep(1)
+            with STATE_LOCK:
+                interval = CONFIG["interval_seconds"]
+                last_ts = CONFIG["last_renewal_ts"]
+            if last_ts > 0 and (time.time() - last_ts) >= interval:
+                log_msg(f"Rotation timer reached ({interval}s). Renewing PostgreSQL TLS certificate...")
+                issue_and_apply_cert()
+
+    if __name__ == "__main__":
+        if "--init" in sys.argv or os.environ.get("INIT_MODE") == "true":
+            log_msg("Running in INIT mode (one-shot issuance)...")
+            while True:
+                ok, res = issue_and_apply_cert()
+                if ok:
+                    log_msg(f"Init cert ready (Serial: {res}). Exiting init container.")
+                    sys.exit(0)
+                log_msg("Waiting for Vault to be ready...")
+                time.sleep(2)
+
+        # Initial issuance for runtime sidecar
+        while True:
+            ok, res = issue_and_apply_cert()
+            if ok:
+                break
+            log_msg("Waiting for Vault to be ready...")
+            time.sleep(2)
+
+        t = threading.Thread(target=rotation_worker, daemon=True)
+        t.start()
+
+        server_address = ("0.0.0.0", PORT)
+        httpd = socketserver.TCPServer(server_address, SidecarHandler)
+        log_msg(f"Sidecar HTTP API listening on port {PORT}...")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: clm-vault-demo
+  labels:
+    app: postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      serviceAccountName: postgres-sa
+      shareProcessNamespace: true
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+      - name: init-cert
+        image: registry.access.redhat.com/ubi9/ubi:latest
+        command: ["/usr/bin/python3", "/scripts/agent.py", "--init"]
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: pg-scripts
+          mountPath: /scripts
+        - name: pg-certs
+          mountPath: /var/lib/pgsql/certs
+      containers:
+      - name: postgresql
+        image: registry.redhat.io/rhel9/postgresql-16:latest
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        env:
+        - name: POSTGRESQL_USER
+          value: "demouser"
+        - name: POSTGRESQL_PASSWORD
+          value: "demopassword"
+        - name: POSTGRESQL_DATABASE
+          value: "clm_demo_db"
+        - name: POSTGRESQL_ADMIN_PASSWORD
+          value: "postgres"
+        ports:
+        - name: postgresql
+          containerPort: 5432
+        volumeMounts:
+        - name: pg-certs
+          mountPath: /var/lib/pgsql/certs
+        - name: pg-scripts
+          mountPath: /opt/app-root/src/postgresql-cfg/ssl.conf
+          subPath: ssl.conf
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+      - name: cert-rotation-sidecar
+        image: registry.access.redhat.com/ubi9/ubi:latest
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        command: ["/usr/bin/python3", "/scripts/agent.py"]
+        ports:
+        - name: agent
+          containerPort: 8000
+        volumeMounts:
+        - name: pg-scripts
+          mountPath: /scripts
+        - name: pg-certs
+          mountPath: /var/lib/pgsql/certs
+        resources:
+          requests:
+            cpu: 20m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
+      volumes:
+      - name: pg-scripts
+        configMap:
+          name: postgres-config
+          defaultMode: 0755
+      - name: pg-certs
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: clm-vault-demo
+  labels:
+    app: postgres
+spec:
+  ports:
+  - name: postgresql
+    port: 5432
+    targetPort: 5432
+  - name: agent
+    port: 8000
+    targetPort: 8000
+  selector:
+    app: postgres

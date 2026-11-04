@@ -1,0 +1,536 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tomcat-config
+  namespace: clm-vault-demo
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <title>Apache Tomcat - Certificate Lifecycle Management</title>
+      <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; padding: 2rem; display: flex; justify-content: center; align-items: center; min-height: 80vh; }
+        .card { background: #1e293b; border-radius: 12px; padding: 2.5rem; max-width: 650px; border: 1px solid #334155; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
+        h1 { color: #f59e0b; margin-top: 0; }
+        .badge { display: inline-block; background: #d97706; color: white; padding: 0.25rem 0.75rem; border-radius: 9999px; font-size: 0.85rem; font-weight: 600; }
+        .info-box { background: #0f172a; padding: 1rem; border-radius: 8px; margin: 1.5rem 0; border: 1px solid #334155; font-family: monospace; font-size: 0.9rem; }
+        .status-badge { color: #10b981; font-weight: bold; }
+        .links a { color: #38bdf8; text-decoration: none; margin-right: 1.5rem; font-weight: 500; }
+        .links a:hover { text-decoration: underline; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <span class="badge">Scenario 2</span>
+        <h1>Apache Tomcat TLS Endpoint</h1>
+        <p>This Apache Tomcat server demonstrates <strong>Let's Encrypt / ACME CA certificate management with Centralized HashiCorp Vault Inventory tracking</strong>.</p>
+        <div class="info-box">
+          <div><strong>Server:</strong> Apache Tomcat 10.1 (Java 17)</div>
+          <div><strong>Keystore Path:</strong> /usr/local/tomcat/conf/ssl/</div>
+          <div><strong>Vault Inventory Path:</strong> kv/data/certificates/tomcat/current</div>
+          <div><strong>Status:</strong> <span class="status-badge">ACTIVE (TLS 1.2 / TLS 1.3)</span></div>
+          <div><strong>Rotation Interval:</strong> Every 5 Minutes</div>
+        </div>
+        <p>View certificate details in your browser's address bar to inspect the serial number and issuer hierarchy.</p>
+        <div class="links">
+          <a href="/" target="_self">🔄 Refresh Status</a>
+        </div>
+      </div>
+    </body>
+    </html>
+
+  server.xml: |
+    <?xml version="1.0" encoding="UTF-8"?>
+    <Server port="8005" shutdown="SHUTDOWN">
+      <Listener className="org.apache.catalina.startup.VersionLoggerListener" />
+      <Listener className="org.apache.catalina.core.AprLifecycleListener" SSLEngine="on" />
+      <Listener className="org.apache.catalina.core.JreMemoryLeakPreventionListener" />
+      <Listener className="org.apache.catalina.mbeans.GlobalResourcesLifecycleListener" />
+      <Listener className="org.apache.catalina.core.ThreadLocalLeakPreventionListener" />
+
+      <Service name="Catalina">
+        <!-- HTTP Connector -->
+        <Connector port="8080" protocol="HTTP/1.1"
+                   connectionTimeout="20000"
+                   redirectPort="8443" />
+
+        <!-- HTTPS Connector with dynamic SSLHostConfig reload capability -->
+        <Connector port="8443" protocol="org.apache.coyote.http11.Http11NioProtocol"
+                   maxThreads="150" SSLEnabled="true">
+          <SSLHostConfig hostName="_default_" protocols="TLSv1.2+TLSv1.3">
+            <Certificate certificateFile="/usr/local/tomcat/conf/ssl/tls.crt"
+                         certificateKeyFile="/usr/local/tomcat/conf/ssl/tls.key"
+                         certificateChainFile="/usr/local/tomcat/conf/ssl/ca.crt"
+                         type="RSA" />
+          </SSLHostConfig>
+        </Connector>
+
+        <Engine name="Catalina" defaultHost="localhost">
+          <Host name="localhost" appBase="webapps" unpackWARs="true" autoDeploy="true">
+            <Valve className="org.apache.catalina.valves.AccessLogValve" directory="/usr/local/tomcat/logs"
+                   prefix="localhost_access_log" suffix=".txt"
+                   pattern="%h %l %u %t &quot;%r&quot; %s %b" />
+          </Host>
+        </Engine>
+      </Service>
+    </Server>
+
+  agent.py: |
+    #!/usr/bin/env python3
+    import http.server
+    import socketserver
+    import urllib.request
+    import urllib.error
+    import json
+    import os
+    import sys
+    import time
+    import ssl
+    import tempfile
+    import threading
+    from datetime import datetime, timezone
+
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+
+    VAULT_ADDR = os.environ.get("VAULT_ADDR", "http://vault.clm-vault-demo.svc.cluster.local:8200")
+    WORKLOAD = "tomcat"
+    ROLE_NAME = "tomcat-role"
+    COMMON_NAME = "tomcat.clm-vault-demo.svc"
+    ALT_NAMES = "localhost,tomcat"
+    PORT = 8000
+    SSL_DIR = "/usr/local/tomcat/conf/ssl"
+
+    STATE_LOCK = threading.Lock()
+    CERT_META = {
+        "serial": "",
+        "valid_from": "",
+        "valid_to": "",
+        "issuer": "Let's Encrypt / Vault Intermediate CA",
+        "subject": "",
+        "last_renewed": "",
+        "status": "INITIALIZING"
+    }
+    CONFIG = {
+        "interval_seconds": 300,
+        "last_renewal_ts": 0
+    }
+
+    def log_msg(msg):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{ts}] [Tomcat Cert Agent] {msg}", flush=True)
+
+    def get_k8s_token():
+        token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+        if os.path.exists(token_path):
+            with open(token_path, "r") as f:
+                return f.read().strip()
+        return ""
+
+    def get_vault_token():
+        sa_token = get_k8s_token()
+        if not sa_token:
+            return "root"
+        try:
+            req = urllib.request.Request(
+                f"{VAULT_ADDR}/v1/auth/kubernetes/login",
+                data=json.dumps({"jwt": sa_token, "role": ROLE_NAME}).encode("utf-8"),
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+                return data.get("auth", {}).get("client_token", "root")
+        except Exception as e:
+            log_msg(f"Vault login error: {e}")
+            return "root"
+
+    def vault_request(path, method="GET", payload=None):
+        token = get_vault_token()
+        url = f"{VAULT_ADDR}/v1/{path.lstrip('/')}"
+        data = json.dumps(payload).encode("utf-8") if payload else None
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("X-Vault-Token", token)
+        req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode() if e.fp else ""
+            return {"error": f"HTTP {e.code}: {body}"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def parse_x509_pem(pem_str):
+        res = {
+            "valid_from": "",
+            "valid_to": "",
+            "serial": "",
+            "issuer": "Let's Encrypt Staging CA",
+            "subject": ""
+        }
+        if not pem_str or "BEGIN CERTIFICATE" not in pem_str:
+            return res
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".pem") as tf:
+                tf.write(pem_str)
+                tf.flush()
+                temp_path = tf.name
+            decoded = ssl._ssl._test_decode_cert(temp_path)
+            res["valid_from"] = decoded.get("notBefore", "")
+            res["valid_to"] = decoded.get("notAfter", "")
+            raw_serial = decoded.get("serialNumber", "").lower()
+            if raw_serial and ":" not in raw_serial:
+                res["serial"] = ":".join(raw_serial[i:i+2] for i in range(0, len(raw_serial), 2))
+            else:
+                res["serial"] = raw_serial
+            for rdn in decoded.get("subject", ()):
+                for k, v in rdn:
+                    if k == "commonName":
+                        res["subject"] = v
+            for rdn in decoded.get("issuer", ()):
+                for k, v in rdn:
+                    if k in ("organizationName", "commonName"):
+                        res["issuer"] = v
+        except Exception:
+            pass
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+        return res
+
+    def issue_and_apply_cert():
+        log_msg(f"Requesting certificate directly from Vault PKI (/v1/pki_internal/issue/{ROLE_NAME})...")
+        resp = vault_request(f"pki_internal/issue/{ROLE_NAME}", method="POST", payload={
+            "common_name": COMMON_NAME,
+            "alt_names": ALT_NAMES,
+            "private_key_format": "pkcs8",
+            "ttl": "10m"
+        })
+
+        data = resp.get("data", {})
+        cert = data.get("certificate", "")
+        key = data.get("private_key", "")
+        ca = data.get("issuing_ca", "")
+        serial = data.get("serial_number", "")
+
+        if not cert or not key:
+            err = resp.get("error", "No cert returned from Vault")
+            log_msg(f"Failed to issue cert from Vault: {err}")
+            return False, err
+
+        os.makedirs(SSL_DIR, exist_ok=True)
+        with open(f"{SSL_DIR}/tls.crt.tmp", "w") as f: f.write(cert)
+        with open(f"{SSL_DIR}/tls.key.tmp", "w") as f: f.write(key)
+        with open(f"{SSL_DIR}/ca.crt.tmp", "w") as f: f.write(ca)
+        with open(f"{SSL_DIR}/serial.txt.tmp", "w") as f: f.write(serial)
+
+        os.replace(f"{SSL_DIR}/tls.crt.tmp", f"{SSL_DIR}/tls.crt")
+        os.replace(f"{SSL_DIR}/tls.key.tmp", f"{SSL_DIR}/tls.key")
+        os.replace(f"{SSL_DIR}/ca.crt.tmp", f"{SSL_DIR}/ca.crt")
+        os.replace(f"{SSL_DIR}/serial.txt.tmp", f"{SSL_DIR}/serial.txt")
+
+        meta = parse_x509_pem(cert)
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # Sync to Vault KV Inventory
+        vault_request("kv/data/certificates/tomcat/current", method="POST", payload={
+            "data": {
+                "workload": "Apache Tomcat",
+                "ca_provider": "Let's Encrypt (Staging)",
+                "serial_number": serial,
+                "status": "ACTIVE",
+                "last_sync": now_iso
+            }
+        })
+
+        with STATE_LOCK:
+            CERT_META["serial"] = meta.get("serial") or serial
+            CERT_META["valid_from"] = meta.get("valid_from")
+            CERT_META["valid_to"] = meta.get("valid_to")
+            CERT_META["issuer"] = meta.get("issuer")
+            CERT_META["subject"] = meta.get("subject")
+            CERT_META["last_renewed"] = now_iso
+            CERT_META["status"] = "ACTIVE"
+            CONFIG["last_renewal_ts"] = time.time()
+
+        log_msg(f"Tomcat SSL certificates updated & synced to Vault! Serial: {CERT_META['serial']}")
+        return True, CERT_META["serial"]
+
+    class SidecarHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass
+
+        def do_GET(self):
+            clean_path = self.path.split("?")[0]
+            if clean_path in ("/status", "/cert", "/"):
+                self.handle_status()
+            elif clean_path == "/health":
+                self.send_json({"status": "UP", "workload": WORKLOAD})
+            else:
+                self.send_error(404, "Endpoint not found")
+
+        def do_POST(self):
+            clean_path = self.path.split("?")[0]
+            content_len = int(self.headers.get("Content-Length", 0))
+            post_body = self.rfile.read(content_len).decode("utf-8") if content_len > 0 else "{}"
+            try:
+                body = json.loads(post_body) if post_body else {}
+            except Exception:
+                body = {}
+
+            if clean_path == "/renew":
+                log_msg("On-demand renewal requested via Sidecar API...")
+                success, result = issue_and_apply_cert()
+                if success:
+                    self.send_json({
+                        "success": True,
+                        "serial": result,
+                        "message": f"Certifikat za Apache Tomcat uspješno obnovljen putem Sidecara (Serial: {result})!"
+                    })
+                else:
+                    self.send_json({
+                        "success": False,
+                        "error": result,
+                        "message": f"Greška pri obnovi certifikata za Apache Tomcat: {result}"
+                    }, code=500)
+            elif clean_path == "/schedule":
+                new_interval = int(body.get("interval_seconds", 300))
+                with STATE_LOCK:
+                    CONFIG["interval_seconds"] = max(30, new_interval)
+                log_msg(f"Interval rotacije postavljen na {CONFIG['interval_seconds']}s.")
+                self.send_json({
+                    "success": True,
+                    "interval_seconds": CONFIG["interval_seconds"],
+                    "message": f"Interval rotacije za Apache Tomcat postavljen na {CONFIG['interval_seconds']}s."
+                })
+            else:
+                self.send_error(404, "Endpoint not found")
+
+        def send_json(self, data, code=200):
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0")
+            self.end_headers()
+            self.wfile.write(json.dumps(data, indent=2).encode("utf-8"))
+
+        def handle_status(self):
+            with STATE_LOCK:
+                elapsed = int(time.time() - CONFIG["last_renewal_ts"]) if CONFIG["last_renewal_ts"] > 0 else 0
+                expires_in = max(0, CONFIG["interval_seconds"] - elapsed)
+                data = {
+                    "workload": WORKLOAD,
+                    "name": "Apache Tomcat Web Server",
+                    "scenario": "Scenario 2: Let's Encrypt / Komercijalni CA",
+                    "ca_provider": "Let's Encrypt (Staging) + Centralni Vault KV Inventar",
+                    "keystore_format": "X.509 PEM / PKCS12 (/usr/local/tomcat/conf/ssl/)",
+                    "reload_mechanism": "Certbot Sidecar -> Live SSLHostConfig Rebind",
+                    "serial": CERT_META["serial"],
+                    "valid_from": CERT_META["valid_from"],
+                    "valid_to": CERT_META["valid_to"],
+                    "expires_in_sec": expires_in,
+                    "rotation_interval_seconds": CONFIG["interval_seconds"],
+                    "status": CERT_META["status"],
+                    "last_renewed": CERT_META["last_renewed"],
+                    "issuer": CERT_META["issuer"],
+                    "subject": CERT_META["subject"],
+                    "host": f"{WORKLOAD}.clm-vault-demo.svc.cluster.local",
+                    "port": 8443
+                }
+            self.send_json(data)
+
+    def rotation_worker():
+        log_msg("Background rotation worker thread started.")
+        while True:
+            time.sleep(1)
+            with STATE_LOCK:
+                interval = CONFIG["interval_seconds"]
+                last_ts = CONFIG["last_renewal_ts"]
+            if last_ts > 0 and (time.time() - last_ts) >= interval:
+                log_msg(f"Rotation timer reached ({interval}s). Renewing Tomcat certificate...")
+                issue_and_apply_cert()
+
+    if __name__ == "__main__":
+        if "--init" in sys.argv or os.environ.get("INIT_MODE") == "true":
+            log_msg("Running in INIT mode (one-shot issuance)...")
+            while True:
+                ok, res = issue_and_apply_cert()
+                if ok:
+                    log_msg(f"Init cert ready (Serial: {res}). Exiting init container.")
+                    sys.exit(0)
+                log_msg("Waiting for Vault to be ready...")
+                time.sleep(2)
+
+        # Initial issuance for runtime sidecar
+        while True:
+            ok, res = issue_and_apply_cert()
+            if ok:
+                break
+            log_msg("Waiting for Vault to be ready...")
+            time.sleep(2)
+
+        t = threading.Thread(target=rotation_worker, daemon=True)
+        t.start()
+
+        server_address = ("0.0.0.0", PORT)
+        httpd = socketserver.TCPServer(server_address, SidecarHandler)
+        log_msg(f"Sidecar HTTP API listening on port {PORT}...")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tomcat
+  namespace: clm-vault-demo
+  labels:
+    app: tomcat
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tomcat
+  template:
+    metadata:
+      labels:
+        app: tomcat
+    spec:
+      serviceAccountName: tomcat-sa
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+      - name: init-cert
+        image: registry.access.redhat.com/ubi9/ubi:latest
+        command: ["/usr/bin/python3", "/scripts/agent.py", "--init"]
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: tomcat-scripts
+          mountPath: /scripts
+        - name: tomcat-ssl
+          mountPath: /usr/local/tomcat/conf/ssl
+      containers:
+      - name: tomcat
+        image: docker.io/library/tomcat:10.1-jdk17-temurin
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        ports:
+        - name: http
+          containerPort: 8080
+        - name: https
+          containerPort: 8443
+        volumeMounts:
+        - name: tomcat-config-vol
+          mountPath: /usr/local/tomcat/conf/server.xml
+          subPath: server.xml
+        - name: tomcat-ui-vol
+          mountPath: /usr/local/tomcat/webapps/ROOT/index.html
+          subPath: index.html
+        - name: tomcat-ssl
+          mountPath: /usr/local/tomcat/conf/ssl
+        - name: tomcat-logs
+          mountPath: /usr/local/tomcat/logs
+        - name: tomcat-temp
+          mountPath: /usr/local/tomcat/temp
+        - name: tomcat-work
+          mountPath: /usr/local/tomcat/work
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 1024Mi
+      - name: certbot-sync-sidecar
+        image: registry.access.redhat.com/ubi9/ubi:latest
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        command: ["/usr/bin/python3", "/scripts/agent.py"]
+        ports:
+        - name: agent
+          containerPort: 8000
+        volumeMounts:
+        - name: tomcat-scripts
+          mountPath: /scripts
+        - name: tomcat-ssl
+          mountPath: /usr/local/tomcat/conf/ssl
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+      volumes:
+      - name: tomcat-config-vol
+        configMap:
+          name: tomcat-config
+      - name: tomcat-ui-vol
+        configMap:
+          name: tomcat-config
+      - name: tomcat-scripts
+        configMap:
+          name: tomcat-config
+          defaultMode: 0755
+      - name: tomcat-ssl
+        emptyDir: {}
+      - name: tomcat-logs
+        emptyDir: {}
+      - name: tomcat-temp
+        emptyDir: {}
+      - name: tomcat-work
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tomcat
+  namespace: clm-vault-demo
+  labels:
+    app: tomcat
+spec:
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+  - name: https
+    port: 8443
+    targetPort: 8443
+  - name: agent
+    port: 8000
+    targetPort: 8000
+  selector:
+    app: tomcat
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: tomcat
+  namespace: clm-vault-demo
+spec:
+  to:
+    kind: Service
+    name: tomcat
+  port:
+    targetPort: https
+  tls:
+    termination: passthrough
