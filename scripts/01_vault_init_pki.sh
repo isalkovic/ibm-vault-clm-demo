@@ -65,13 +65,13 @@ vault write pki_internal/config/urls \
   issuing_certificates="http://vault.clm-vault-demo.svc.cluster.local:8200/v1/pki_internal/ca" \
   crl_distribution_points="http://vault.clm-vault-demo.svc.cluster.local:8200/v1/pki_internal/crl"
 
-echo "=== 2.3 Setup External / Public CA Engine in Vault (Pattern A Proxy for Let's Encrypt / DigiCert) ==="
+echo "=== 2.3 Setup External / Public CA Engine in Vault (Pattern A Proxy for Lets Encrypt / DigiCert) ==="
 # External Public Root CA
 vault secrets enable -path=pki_external_root pki || true
 vault secrets tune -max-lease-ttl=87600h pki_external_root
 
 vault write -field=certificate pki_external_root/root/generate/internal \
-  common_name="DigiCert Global Root G2 / Let's Encrypt ISRG Root X1" \
+  common_name="DigiCert Global Root G2 / Lets Encrypt ISRG Root X1" \
   issuer_name="public-root-ca" \
   ttl=87600h > /tmp/ext_root_ca.crt
 
@@ -80,7 +80,7 @@ vault secrets enable -path=pki_external pki || true
 vault secrets tune -max-lease-ttl=43800h pki_external
 
 vault write -format=json pki_external/intermediate/generate/internal \
-  common_name="Let's Encrypt R3 / DigiCert TLS RSA Intermediate CA (via Vault Proxy)" \
+  common_name="Lets Encrypt R3 / DigiCert TLS RSA Intermediate CA (via Vault Proxy)" \
   issuer_name="public-intermediate-ca" \
   ttl=43800h > /tmp/ext_intermediate.json
 
@@ -110,7 +110,7 @@ vault write pki_internal/roles/liberty-role \
   max_ttl="30m" \
   ttl="10m"
 
-# Role for Tomcat (Scenario 2 - Pattern A: Vault Intermediary for Let's Encrypt / DigiCert)
+# Role for Tomcat (Scenario 2 - Pattern A: Vault Intermediary for Lets Encrypt / DigiCert)
 vault write pki_external/roles/tomcat-role \
   allow_any_name=true \
   allow_subdomains=true \
