@@ -71,7 +71,7 @@ vault secrets enable -path=pki_external_root pki || true
 vault secrets tune -max-lease-ttl=87600h pki_external_root
 
 vault write -field=certificate pki_external_root/root/generate/internal \
-  common_name="DigiCert Global Root G2 / Lets Encrypt ISRG Root X1" \
+  common_name="DigiCert Global Root G2" \
   issuer_name="public-root-ca" \
   ttl=87600h > /tmp/ext_root_ca.crt
 
@@ -80,7 +80,7 @@ vault secrets enable -path=pki_external pki || true
 vault secrets tune -max-lease-ttl=43800h pki_external
 
 vault write -format=json pki_external/intermediate/generate/internal \
-  common_name="Lets Encrypt R3 / DigiCert TLS RSA Intermediate CA (via Vault Proxy)" \
+  common_name="Lets Encrypt R3 Intermediate CA" \
   issuer_name="public-intermediate-ca" \
   ttl=43800h > /tmp/ext_intermediate.json
 
