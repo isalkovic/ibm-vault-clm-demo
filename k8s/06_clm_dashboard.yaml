@@ -290,10 +290,10 @@ data:
                         "id": 2,
                         "slug": "tomcat",
                         "name": "Apache Tomcat Web Server",
-                        "scenario": "Scenario 2: Let's Encrypt / Komercijalni CA",
-                        "ca_provider": "Let's Encrypt (Staging) + Centralni Vault KV Inventar",
+                        "scenario": "Scenario 2: Let's Encrypt / DigiCert Public CA (Pattern A)",
+                        "ca_provider": "Vault Intermediary Public CA Proxy (Let's Encrypt / DigiCert)",
                         "keystore_format": "X.509 PEM / PKCS12 (/usr/local/tomcat/conf/ssl/)",
-                        "reload_mechanism": "Certbot Sidecar -> Live SSLHostConfig Rebind",
+                        "reload_mechanism": "Tomcat Sidecar -> Vault Intermediary API -> Live SSLHostConfig Rebind",
                         "port": 8443
                     }
                 ),

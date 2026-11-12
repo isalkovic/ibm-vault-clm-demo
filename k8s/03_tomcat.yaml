@@ -23,17 +23,19 @@ data:
     </head>
     <body>
       <div class="card">
-        <span class="badge">Scenario 2</span>
+        <span class="badge">Scenario 2 (Pattern A)</span>
         <h1>Apache Tomcat TLS Endpoint</h1>
-        <p>This Apache Tomcat server demonstrates <strong>Let's Encrypt / ACME CA certificate management with Centralized HashiCorp Vault Inventory tracking</strong>.</p>
+        <p>This Apache Tomcat server demonstrates <strong>Pattern A: Vault as Intermediary Proxy for Public CA (Let's Encrypt / DigiCert)</strong>.</p>
         <div class="info-box">
+          <div><strong>Architecture:</strong> Tomcat Sidecar &rarr; Vault API (K8s Auth) &rarr; Vault Public CA Proxy</div>
           <div><strong>Server:</strong> Apache Tomcat 10.1 (Java 17)</div>
+          <div><strong>Issuer Hierarchy:</strong> Let's Encrypt R3 / DigiCert Intermediate &larr; Public Root CA</div>
           <div><strong>Keystore Path:</strong> /usr/local/tomcat/conf/ssl/</div>
           <div><strong>Vault Inventory Path:</strong> kv/data/certificates/tomcat/current</div>
           <div><strong>Status:</strong> <span class="status-badge">ACTIVE (TLS 1.2 / TLS 1.3)</span></div>
           <div><strong>Rotation Interval:</strong> Every 5 Minutes</div>
         </div>
-        <p>View certificate details in your browser's address bar to inspect the serial number and issuer hierarchy.</p>
+        <p>Tomcat sidecar communicates solely with HashiCorp Vault; Vault brokers issuance with the public/external CA and synchronizes the central certificate inventory.</p>
         <div class="links">
           <a href="/" target="_self">🔄 Refresh Status</a>
         </div>
@@ -108,7 +110,7 @@ data:
         "serial": "",
         "valid_from": "",
         "valid_to": "",
-        "issuer": "Let's Encrypt / Vault Intermediate CA",
+        "issuer": "Let's Encrypt R3 / DigiCert (via Vault Proxy)",
         "subject": "",
         "last_renewed": "",
         "status": "INITIALIZING"
@@ -167,7 +169,7 @@ data:
             "valid_from": "",
             "valid_to": "",
             "serial": "",
-            "issuer": "Let's Encrypt Staging CA",
+            "issuer": "Let's Encrypt R3 / DigiCert (via Vault Proxy)",
             "subject": ""
         }
         if not pem_str or "BEGIN CERTIFICATE" not in pem_str:
@@ -205,8 +207,8 @@ data:
         return res
 
     def issue_and_apply_cert():
-        log_msg(f"Requesting certificate directly from Vault PKI (/v1/pki_internal/issue/{ROLE_NAME})...")
-        resp = vault_request(f"pki_internal/issue/{ROLE_NAME}", method="POST", payload={
+        log_msg(f"Pattern A: Requesting Public/External CA cert via Vault Intermediary Proxy (/v1/pki_external/issue/{ROLE_NAME})...")
+        resp = vault_request(f"pki_external/issue/{ROLE_NAME}", method="POST", payload={
             "common_name": COMMON_NAME,
             "alt_names": ALT_NAMES,
             "private_key_format": "pkcs8",
@@ -241,8 +243,8 @@ data:
         # Sync to Vault KV Inventory
         vault_request("kv/data/certificates/tomcat/current", method="POST", payload={
             "data": {
-                "workload": "Apache Tomcat",
-                "ca_provider": "Let's Encrypt (Staging)",
+                "workload": "Apache Tomcat (Pattern A)",
+                "ca_provider": "Vault Intermediary Proxy (Let's Encrypt / DigiCert)",
                 "serial_number": serial,
                 "status": "ACTIVE",
                 "last_sync": now_iso
@@ -327,10 +329,10 @@ data:
                 data = {
                     "workload": WORKLOAD,
                     "name": "Apache Tomcat Web Server",
-                    "scenario": "Scenario 2: Let's Encrypt / Komercijalni CA",
-                    "ca_provider": "Let's Encrypt (Staging) + Centralni Vault KV Inventar",
+                    "scenario": "Scenario 2: Let's Encrypt / DigiCert Public CA (Pattern A)",
+                    "ca_provider": "Vault Intermediary Public CA Proxy (Let's Encrypt / DigiCert)",
                     "keystore_format": "X.509 PEM / PKCS12 (/usr/local/tomcat/conf/ssl/)",
-                    "reload_mechanism": "Certbot Sidecar -> Live SSLHostConfig Rebind",
+                    "reload_mechanism": "Tomcat Sidecar -> Vault Intermediary API -> Live SSLHostConfig Rebind",
                     "serial": CERT_META["serial"],
                     "valid_from": CERT_META["valid_from"],
                     "valid_to": CERT_META["valid_to"],

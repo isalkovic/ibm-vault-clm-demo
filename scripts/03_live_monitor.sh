@@ -36,12 +36,13 @@ while true; do
   # 2. Apache Tomcat Status
   TOMCAT_POD=$(oc get pod -n "$NAMESPACE" -l app=tomcat -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
   if [ -n "$TOMCAT_POD" ]; then
-    echo "--- [Scenario 2: Apache Tomcat (Let's Encrypt Staging / Certbot)] ---"
+    echo "--- [Scenario 2: Apache Tomcat (Pattern A: Vault Intermediary Proxy for Public CA)] ---"
     SERIAL=$(oc exec -n "$NAMESPACE" "$TOMCAT_POD" -c certbot-sync-sidecar -- cat /usr/local/tomcat/conf/ssl/serial.txt 2>/dev/null || echo "Initializing...")
     echo "Pod: $TOMCAT_POD"
     echo "TLS Certificate Serial: $SERIAL"
+    echo "Architecture: Tomcat Sidecar -> Vault API (/v1/pki_external) -> Let's Encrypt / DigiCert Proxy"
     echo "Tracking: Synced to Vault Central KV Inventory (/v1/kv/data/certificates/tomcat/current)"
-    echo "Reload Mechanism: Certbot Hook -> SSLHostConfig Live Refresh"
+    echo "Reload Mechanism: Tomcat Sidecar -> Live SSLHostConfig Rebind"
   fi
   echo ""
 

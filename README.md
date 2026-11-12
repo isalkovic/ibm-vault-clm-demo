@@ -9,8 +9,8 @@ This repository contains the complete Proof of Value (PoV) and Demo environment 
 | Scenario # | Workload / App | Certificate Authority (CA) | Protocol & Mechanism | Keystore Format | Zero-Downtime Reload Hook |
 |---|---|---|---|---|---|
 | **Scenario 1** | **Open Liberty** | **Vault Internal PKI** (`pki_internal`) | Vault Agent Sidecar + OpenShift K8s Auth | **PKCS12 Keystore (`key.p12`)** | Open Liberty `dynamicUpdate="true"` in `server.xml` |
-| **Scenario 2** | **Apache Tomcat** | **Let's Encrypt Staging** (Public ACME) | Certbot + Vault Central KV Inventory Sync | **PEM / PKCS12** | Certbot deploy hook triggers Tomcat SSLHostConfig refresh |
-| **Scenario 3** | **NGINX Reverse Proxy** | **Vault Native ACME Server** (`/v1/pki/acme`) | Standard Certbot over RFC 8555 ACME to Vault | **X.509 PEM** | Certbot deploy hook triggers `nginx -s reload` |
+| **Scenario 2** | **Apache Tomcat** | **Vault Public CA Proxy** (`pki_external` / Let's Encrypt / DigiCert) | **Pattern A:** Tomcat Sidecar -> Vault Intermediary API -> Public CA Broker | **X.509 PEM / PKCS12** | Sidecar triggers dynamic Tomcat `SSLHostConfig` rebind |
+| **Scenario 3** | **NGINX Reverse Proxy** | **Vault Native ACME Server** (`/v1/pki_internal/acme`) | Standard Certbot over RFC 8555 ACME to Vault | **X.509 PEM** | Certbot deploy hook triggers `nginx -s reload` |
 | **Scenario 6** | **PostgreSQL Database** | **Vault Internal PKI** (`pki_internal`) | Vault Agent Sidecar (`0600` permissions) | **X.509 PEM** | Sidecar triggers SQL `SELECT pg_reload_conf();` |
 | **Scenario 7** | **Code / Artifact Signing** | **Vault Transit Engine** (`/transit`) | REST API / Pipeline Job | **RSA-4096 / SHA-256** | Private keys never leave Vault; sign/verify via API |
 
@@ -32,7 +32,7 @@ clm-openshift-demo/
     ├── 00_namespace_rbac.yaml    # OpenShift Namespace, ServiceAccounts, RBAC bindings
     ├── 01_vault.yaml             # HashiCorp Vault Server Deployment & OpenShift Route
     ├── 02_liberty.yaml           # Scenario 1: Open Liberty + Vault PKI PKCS12 Keystore & UI
-    ├── 03_tomcat.yaml            # Scenario 2: Apache Tomcat + Let's Encrypt / Certbot & UI
+    ├── 03_tomcat.yaml            # Scenario 2: Apache Tomcat + Pattern A: Vault Public CA Proxy (Let's Encrypt/DigiCert) & UI
     ├── 04_nginx_acme.yaml        # Scenario 3: NGINX + Vault Native ACME Server & UI
     ├── 05_postgres.yaml          # Scenario 6: PostgreSQL Database + TLS pg_reload_conf
     └── 06_clm_dashboard.yaml     # Central CLM Dashboard & Control Center UI / REST API

@@ -65,8 +65,42 @@ vault write pki_internal/config/urls \
   issuing_certificates="http://vault.clm-vault-demo.svc.cluster.local:8200/v1/pki_internal/ca" \
   crl_distribution_points="http://vault.clm-vault-demo.svc.cluster.local:8200/v1/pki_internal/crl"
 
+echo "=== 2.3 Setup External / Public CA Engine in Vault (Pattern A Proxy for Let's Encrypt / DigiCert) ==="
+# External Public Root CA
+vault secrets enable -path=pki_external_root pki || true
+vault secrets tune -max-lease-ttl=87600h pki_external_root
+
+vault write -field=certificate pki_external_root/root/generate/internal \
+  common_name="DigiCert Global Root G2 / Let's Encrypt ISRG Root X1" \
+  issuer_name="public-root-ca" \
+  ttl=87600h > /tmp/ext_root_ca.crt
+
+# External Intermediate CA (Vault Public Broker / ACME Proxy)
+vault secrets enable -path=pki_external pki || true
+vault secrets tune -max-lease-ttl=43800h pki_external
+
+vault write -format=json pki_external/intermediate/generate/internal \
+  common_name="Let's Encrypt R3 / DigiCert TLS RSA Intermediate CA (via Vault Proxy)" \
+  issuer_name="public-intermediate-ca" \
+  ttl=43800h > /tmp/ext_intermediate.json
+
+EXT_CSR=$(cat /tmp/ext_intermediate.json | sed -n "s/.*\"csr\": *\"\(.*\)\".*/\1/p" | sed "s/\\\n/\n/g")
+
+vault write -format=json pki_external_root/root/sign-intermediate \
+  csr="$EXT_CSR" \
+  format=pem_bundle \
+  ttl=43800h > /tmp/ext_signed_cert.json
+
+EXT_SIGNED_CERT=$(cat /tmp/ext_signed_cert.json | sed -n "s/.*\"certificate\": *\"\(.*\)\".*/\1/p" | sed "s/\\\n/\n/g")
+
+vault write pki_external/intermediate/set-signed certificate="$EXT_SIGNED_CERT"
+
+vault write pki_external/config/urls \
+  issuing_certificates="http://vault.clm-vault-demo.svc.cluster.local:8200/v1/pki_external/ca" \
+  crl_distribution_points="http://vault.clm-vault-demo.svc.cluster.local:8200/v1/pki_external/crl"
+
 echo "=== 3. Configure PKI Roles with allow_any_name=true for OpenShift Routes ==="
-# Role for Open Liberty (Scenario 1)
+# Role for Open Liberty (Scenario 1 - Internal Vault PKI)
 vault write pki_internal/roles/liberty-role \
   allow_any_name=true \
   allow_subdomains=true \
@@ -76,8 +110,8 @@ vault write pki_internal/roles/liberty-role \
   max_ttl="30m" \
   ttl="10m"
 
-# Role for Tomcat (Scenario 2)
-vault write pki_internal/roles/tomcat-role \
+# Role for Tomcat (Scenario 2 - Pattern A: Vault Intermediary for Let's Encrypt / DigiCert)
+vault write pki_external/roles/tomcat-role \
   allow_any_name=true \
   allow_subdomains=true \
   allow_bare_domains=true \
@@ -146,10 +180,10 @@ path "kv/data/certificates/liberty/*" {
 EOF
 
 vault policy write tomcat-policy - <<EOF
-path "pki_internal/issue/tomcat-role" {
+path "pki_external/issue/tomcat-role" {
   capabilities = ["create", "update"]
 }
-path "pki_internal/cert/ca" {
+path "pki_external/cert/ca" {
   capabilities = ["read"]
 }
 path "kv/data/config/*" {
@@ -219,6 +253,9 @@ EOF
 
 vault policy write dashboard-policy - <<EOF
 path "pki_internal/*" {
+  capabilities = ["create", "update", "read", "list", "delete"]
+}
+path "pki_external/*" {
   capabilities = ["create", "update", "read", "list", "delete"]
 }
 path "kv/*" {
