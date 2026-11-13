@@ -104,11 +104,23 @@ oc get route clm-dashboard -n clm-vault-demo -o jsonpath='{.spec.host}'
 5. **Interactive Code Signing & Tamper Demo:** Test Scenario 7 software supply chain signing and simulate tamper attacks with instant cryptographic rejection.
 6. **Central Audit Log:** Visual history of all issuance, renewal, and verification events.
 
-#### D. Visual Workload Endpoints
+#### D. Visual Workload Endpoints (OpenShift)
 * **Open Liberty:** `https://liberty-clm-vault-demo.apps.<cluster>/`
 * **Apache Tomcat:** `https://tomcat-clm-vault-demo.apps.<cluster>/`
 * **NGINX Proxy:** `https://nginx-clm-vault-demo.apps.<cluster>/`
 * **Vault Console:** `https://vault-clm-vault-demo.apps.<cluster>/ui`
+
+#### E. Standalone RHEL 9 VM Deployments (Open Liberty & MySQL 8.0)
+For non-containerized enterprise virtual machines running Red Hat Enterprise Linux 9:
+```bash
+cd rhel9-vm
+sudo ./deploy.sh      # Installs Open Liberty 24.0.0.12, Java 17, and MySQL 8.0
+sudo ./config.sh      # Issues Vault certificates, configures keystores, and starts systemd daemons
+./scripts/05_test_rotation.sh  # Real-time CLI verification and live rotation tester
+```
+* **Endpoints on RHEL 9 VM:**
+  * Open Liberty HTTPS: `https://<RHEL9_IP>:9443/` (Sidecar API: `http://<RHEL9_IP>:8001/status`)
+  * MySQL 8.0 TLS: `<RHEL9_IP>:3306` (Sidecar API: `http://<RHEL9_IP>:8002/status`)
 
 ---
 
