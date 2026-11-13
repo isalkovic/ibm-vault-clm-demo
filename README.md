@@ -6,13 +6,15 @@ This repository contains the complete Proof of Value (PoV) and Demo environment 
 
 ## 🏛️ Architecture & Scenarios Matrix
 
-| Scenario # | Workload / App | Certificate Authority (CA) | Protocol & Mechanism | Keystore Format | Zero-Downtime Reload Hook |
+| Scenario # | Workload / App | Platform | Certificate Authority (CA) | Keystore Format | Zero-Downtime Reload Hook |
 |---|---|---|---|---|---|
-| **Scenario 1** | **Open Liberty** | **Vault Internal PKI** (`pki_internal`) | Vault Agent Sidecar + OpenShift K8s Auth | **PKCS12 Keystore (`key.p12`)** | Open Liberty `dynamicUpdate="true"` in `server.xml` |
-| **Scenario 2** | **Apache Tomcat** | **Vault Public CA Proxy** (`pki_external` / Let's Encrypt / DigiCert) | **Pattern A:** Tomcat Sidecar -> Vault Intermediary API -> Public CA Broker | **X.509 PEM / PKCS12** | Sidecar triggers dynamic Tomcat `SSLHostConfig` rebind |
-| **Scenario 3** | **NGINX Reverse Proxy** | **Vault Native ACME Server** (`/v1/pki_internal/acme`) | Standard Certbot over RFC 8555 ACME to Vault | **X.509 PEM** | Certbot deploy hook triggers `nginx -s reload` |
-| **Scenario 6** | **PostgreSQL Database** | **Vault Internal PKI** (`pki_internal`) | Vault Agent Sidecar (`0600` permissions) | **X.509 PEM** | Sidecar triggers SQL `SELECT pg_reload_conf();` |
-| **Scenario 7** | **Code / Artifact Signing** | **Vault Transit Engine** (`/transit`) | REST API / Pipeline Job | **RSA-4096 / SHA-256** | Private keys never leave Vault; sign/verify via API |
+| **Scenario 1** | **Open Liberty** | **Red Hat OpenShift** | **Vault Internal PKI** (`pki_internal`) | **PKCS12 (`key.p12`)** | Open Liberty `dynamicUpdate="true"` in `server.xml` |
+| **Scenario 2** | **Apache Tomcat** | **Red Hat OpenShift** | **Vault Public CA Proxy** (`pki_external`) | **PEM / PKCS12** | Sidecar triggers dynamic Tomcat `SSLHostConfig` rebind |
+| **Scenario 3** | **NGINX Reverse Proxy** | **Red Hat OpenShift** | **Vault Native ACME Server** (`/v1/pki/acme`) | **X.509 PEM** | Certbot deploy hook triggers `nginx -s reload` |
+| **Scenario 6** | **PostgreSQL DB** | **Red Hat OpenShift** | **Vault Internal PKI** (`pki_internal`) | **X.509 PEM (`0600`)** | Sidecar triggers SQL `SELECT pg_reload_conf();` |
+| **Scenario 7** | **Code / Artifact Signing**| **CI/CD Pipeline** | **Vault Transit Engine** (`/transit`) | **RSA-4096 / SHA-256** | Private keys never leave Vault; sign/verify via API |
+| **Scenario 8** | **Open Liberty on VM** | **RHEL 9 VM (Standalone)** | **Vault Internal PKI** (`pki_internal`) | **PKCS12 (`key.p12`)** | `clm-liberty-agent` systemd daemon + `dynamicUpdate="true"` |
+| **Scenario 9** | **MySQL 8.0 on VM** | **RHEL 9 VM (Standalone)** | **Vault Internal PKI** (`pki_internal`) | **X.509 PEM (`0600`)** | `clm-mysql-agent` daemon + `ALTER INSTANCE RELOAD TLS;` |
 
 ---
 
@@ -28,6 +30,12 @@ clm-openshift-demo/
 │   ├── 01_vault_init_pki.sh      # Initializes Vault PKI, ACME, Transit, & K8s Auth
 │   ├── 02_demo_code_signing.sh   # Executes Scenario 7 (Artifact/JAR signing & tampering demo)
 │   └── 03_live_monitor.sh        # Real-time multi-workload certificate rotation watcher
+├── rhel9-vm/                     # RHEL 9 Standalone VM Deployments (Open Liberty & MySQL)
+│   ├── deploy.sh                 # Installs Open Liberty runtime, Java 17, and MySQL 8.0 on RHEL 9
+│   ├── config.sh                 # Sets up TLS certificates, keystores, and systemd rotation daemons
+│   ├── teardown.sh               # Stops daemons, removes packages, and cleans directories
+│   ├── README.md                 # Complete RHEL 9 VM setup and live rotation guide
+│   └── scripts/                  # Individual deployment, configuration, and verification scripts
 └── k8s/
     ├── 00_namespace_rbac.yaml    # OpenShift Namespace, ServiceAccounts, RBAC bindings
     ├── 01_vault.yaml             # HashiCorp Vault Server Deployment & OpenShift Route
