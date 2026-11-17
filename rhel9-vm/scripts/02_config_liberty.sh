@@ -231,53 +231,58 @@ def parse_x509_pem(pem_str):
     return res
 
 def issue_and_apply_cert():
-    log_msg(f"Requesting certificate from Vault PKI (/v1/pki_internal/issue/{ROLE_NAME})...")
-    resp = vault_request(f"pki_internal/issue/{ROLE_NAME}", method="POST", payload={
-        "common_name": COMMON_NAME,
-        "alt_names": ALT_NAMES,
-        "private_key_format": "pkcs8",
-        "ttl": "10m"
-    })
+    try:
+        log_msg(f"Requesting certificate from Vault PKI (/v1/pki_internal/issue/{ROLE_NAME})...")
+        resp = vault_request(f"pki_internal/issue/{ROLE_NAME}", method="POST", payload={
+            "common_name": COMMON_NAME,
+            "alt_names": ALT_NAMES,
+            "private_key_format": "pkcs8",
+            "ttl": "10m"
+        })
 
-    data = resp.get("data", {})
-    cert = data.get("certificate", "")
-    key = data.get("private_key", "")
-    ca = data.get("issuing_ca", "")
-    serial = data.get("serial_number", "")
+        data = resp.get("data", {}) if isinstance(resp, dict) else {}
+        cert = data.get("certificate", "")
+        key = data.get("private_key", "")
+        ca = data.get("issuing_ca", "")
+        serial = data.get("serial_number", "")
 
-    if not cert or not key:
-        # Generate self-signed fallback if Vault is not yet reachable during initial bootstrap
-        log_msg("Vault not available; generating initial bootstrap certificate...")
-        subprocess.run([
-            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", "/tmp/clm_p12/key.pem",
-            "-out", "/tmp/clm_p12/cert.pem", "-days", "1", "-nodes", "-subj", f"/CN={COMMON_NAME}"
-        ], check=True)
-        with open("/tmp/clm_p12/cert.pem") as f: cert = f.read()
-        with open("/tmp/clm_p12/key.pem") as f: key = f.read()
-        ca = cert
-        serial = "BOOTSTRAP-INIT"
+        if not cert or not key:
+            # Generate self-signed fallback if Vault is not yet reachable during initial bootstrap
+            log_msg("Vault not available; generating initial bootstrap certificate...")
+            os.makedirs("/tmp/clm_p12", exist_ok=True)
+            subprocess.run([
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", "/tmp/clm_p12/key.pem",
+                "-out", "/tmp/clm_p12/cert.pem", "-days", "1", "-nodes", "-subj", f"/CN={COMMON_NAME}"
+            ], check=True)
+            with open("/tmp/clm_p12/cert.pem") as f: cert = f.read()
+            with open("/tmp/clm_p12/key.pem") as f: key = f.read()
+            ca = cert
+            serial = "BOOTSTRAP-INIT"
 
-    os.makedirs(SECURITY_DIR, exist_ok=True)
-    generate_pkcs12(cert, key, ca, P12_PATH, P12_PASS)
+        os.makedirs(SECURITY_DIR, exist_ok=True)
+        generate_pkcs12(cert, key, ca, P12_PATH, P12_PASS)
 
-    with open(f"{SECURITY_DIR}/serial.txt", "w") as f:
-        f.write(serial)
+        with open(f"{SECURITY_DIR}/serial.txt", "w") as f:
+            f.write(serial)
 
-    meta = parse_x509_pem(cert)
-    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        meta = parse_x509_pem(cert)
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    with STATE_LOCK:
-        CERT_META["serial"] = meta.get("serial") or serial
-        CERT_META["valid_from"] = meta.get("valid_from")
-        CERT_META["valid_to"] = meta.get("valid_to")
-        CERT_META["issuer"] = meta.get("issuer") or "Enterprise Demo Intermediate CA"
-        CERT_META["subject"] = meta.get("subject") or f"CN={COMMON_NAME}"
-        CERT_META["last_renewed"] = now_iso
-        CERT_META["status"] = "ACTIVE"
-        CONFIG["last_renewal_ts"] = time.time()
+        with STATE_LOCK:
+            CERT_META["serial"] = meta.get("serial") or serial
+            CERT_META["valid_from"] = meta.get("valid_from")
+            CERT_META["valid_to"] = meta.get("valid_to")
+            CERT_META["issuer"] = meta.get("issuer") or "Enterprise Demo Intermediate CA"
+            CERT_META["subject"] = meta.get("subject") or f"CN={COMMON_NAME}"
+            CERT_META["last_renewed"] = now_iso
+            CERT_META["status"] = "ACTIVE"
+            CONFIG["last_renewal_ts"] = time.time()
 
-    log_msg(f"Open Liberty PKCS12 keystore updated! (Serial: {CERT_META['serial']}) - dynamicUpdate will hot-reload TLS.")
-    return True, CERT_META["serial"]
+        log_msg(f"Open Liberty PKCS12 keystore updated! (Serial: {CERT_META['serial']}) - dynamicUpdate will hot-reload TLS.")
+        return True, CERT_META["serial"]
+    except Exception as e:
+        log_msg(f"Error in issue_and_apply_cert: {e}")
+        return False, str(e)
 
 class AgentHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args): pass
@@ -342,7 +347,10 @@ def rotation_worker():
             issue_and_apply_cert()
 
 if __name__ == "__main__":
-    issue_and_apply_cert()
+    try:
+        issue_and_apply_cert()
+    except Exception as e:
+        log_msg(f"Startup certificate warning: {e}")
     t = threading.Thread(target=rotation_worker, daemon=True)
     t.start()
     socketserver.TCPServer.allow_reuse_address = True

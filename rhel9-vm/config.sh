@@ -25,6 +25,55 @@ chmod +x "$SCRIPT_DIR"/scripts/*.sh
 
 echo ""
 echo "=========================================================================="
+echo "   AUTOMATIC SERVICE HEALTH & AGENT REST API VERIFICATION"
+echo "=========================================================================="
+
+SERVICES=("openliberty.service" "clm-liberty-agent.service" "clm-mysql-agent.service")
+if systemctl list-unit-files | grep -q mariadb.service; then
+  SERVICES+=("mariadb.service")
+elif systemctl list-unit-files | grep -q mysqld.service; then
+  SERVICES+=("mysqld.service")
+fi
+
+ALL_ACTIVE=1
+for svc in "${SERVICES[@]}"; do
+  echo -n "[+] Checking service '$svc' ... "
+  if systemctl is-active --quiet "$svc"; then
+    echo "[ACTIVE ✓]"
+  else
+    echo "[INACTIVE / FAILED ✗]"
+    ALL_ACTIVE=0
+    echo "    --- Recent Logs for $svc ---"
+    journalctl -u "$svc" -n 10 --no-pager || true
+    echo "    ----------------------------"
+  fi
+done
+
+echo ""
+echo "[+] Probing Agent REST API endpoints on ports 8001 and 8002..."
+for port in 8001 8002; do
+  PROBED=0
+  for i in {1..10}; do
+    if curl -s "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
+      STATUS_JSON=$(curl -s "http://127.0.0.1:${port}/status" | jq -r '.status // "UP"' 2>/dev/null || echo "UP")
+      echo "[✓] Port ${port} Agent REST API is active and healthy (Status: ${STATUS_JSON})"
+      PROBED=1
+      break
+    fi
+    sleep 1
+  done
+  if [ "$PROBED" -eq 0 ]; then
+    echo "[-] Warning: Port ${port} Agent REST API did not respond within 10s."
+    if [ "$port" -eq 8001 ]; then
+      journalctl -u clm-liberty-agent.service -n 15 --no-pager || true
+    else
+      journalctl -u clm-mysql-agent.service -n 15 --no-pager || true
+    fi
+  fi
+done
+
+echo ""
+echo "=========================================================================="
 echo " [SUCCESS] RHEL 9 Certificate Lifecycle Management Configured!"
 echo " "
 echo " Active Workloads & Endpoints on this RHEL 9 VM:"

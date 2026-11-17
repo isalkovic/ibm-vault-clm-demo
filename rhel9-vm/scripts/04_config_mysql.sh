@@ -179,74 +179,78 @@ def reload_mysql_tls():
     return False
 
 def issue_and_apply_cert():
-    log_msg(f"Requesting certificate from Vault PKI (/v1/pki_internal/issue/{ROLE_NAME})...")
-    resp = vault_request(f"pki_internal/issue/{ROLE_NAME}", method="POST", payload={
-        "common_name": COMMON_NAME,
-        "alt_names": ALT_NAMES,
-        "private_key_format": "pkcs8",
-        "ttl": "10m"
-    })
+    try:
+        log_msg(f"Requesting certificate from Vault PKI (/v1/pki_internal/issue/{ROLE_NAME})...")
+        resp = vault_request(f"pki_internal/issue/{ROLE_NAME}", method="POST", payload={
+            "common_name": COMMON_NAME,
+            "alt_names": ALT_NAMES,
+            "private_key_format": "pkcs8",
+            "ttl": "10m"
+        })
 
-    data = resp.get("data", {})
-    cert = data.get("certificate", "")
-    key = data.get("private_key", "")
-    ca = data.get("issuing_ca", "")
-    serial = data.get("serial_number", "")
+        data = resp.get("data", {}) if isinstance(resp, dict) else {}
+        cert = data.get("certificate", "")
+        key = data.get("private_key", "")
+        ca = data.get("issuing_ca", "")
+        serial = data.get("serial_number", "")
 
-    if not cert or not key:
-        log_msg("Vault not available; generating initial bootstrap certificate...")
-        subprocess.run([
-            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", "/tmp/mysql_boot_key.pem",
-            "-out", "/tmp/mysql_boot_cert.pem", "-days", "1", "-nodes", "-subj", f"/CN={COMMON_NAME}"
-        ], check=True)
-        with open("/tmp/mysql_boot_cert.pem") as f: cert = f.read()
-        with open("/tmp/mysql_boot_key.pem") as f: key = f.read()
-        ca = cert
-        serial = "BOOTSTRAP-INIT"
+        if not cert or not key:
+            log_msg("Vault not available; generating initial bootstrap certificate...")
+            subprocess.run([
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", "/tmp/mysql_boot_key.pem",
+                "-out", "/tmp/mysql_boot_cert.pem", "-days", "1", "-nodes", "-subj", f"/CN={COMMON_NAME}"
+            ], check=True)
+            with open("/tmp/mysql_boot_cert.pem") as f: cert = f.read()
+            with open("/tmp/mysql_boot_key.pem") as f: key = f.read()
+            ca = cert
+            serial = "BOOTSTRAP-INIT"
 
-    os.makedirs(CERTS_DIR, exist_ok=True)
-    
-    cert_file = f"{CERTS_DIR}/server-cert.pem"
-    key_file = f"{CERTS_DIR}/server-key.pem"
-    ca_file = f"{CERTS_DIR}/ca.pem"
-    serial_file = f"{CERTS_DIR}/serial.txt"
+        os.makedirs(CERTS_DIR, exist_ok=True)
+        
+        cert_file = f"{CERTS_DIR}/server-cert.pem"
+        key_file = f"{CERTS_DIR}/server-key.pem"
+        ca_file = f"{CERTS_DIR}/ca.pem"
+        serial_file = f"{CERTS_DIR}/serial.txt"
 
-    with open(f"{cert_file}.tmp", "w") as f: f.write(cert)
-    with open(f"{key_file}.tmp", "w") as f: f.write(key)
-    with open(f"{ca_file}.tmp", "w") as f: f.write(ca)
-    with open(f"{serial_file}.tmp", "w") as f: f.write(serial)
+        with open(f"{cert_file}.tmp", "w") as f: f.write(cert)
+        with open(f"{key_file}.tmp", "w") as f: f.write(key)
+        with open(f"{ca_file}.tmp", "w") as f: f.write(ca)
+        with open(f"{serial_file}.tmp", "w") as f: f.write(serial)
 
-    os.replace(f"{cert_file}.tmp", cert_file)
-    os.replace(f"{key_file}.tmp", key_file)
-    os.replace(f"{ca_file}.tmp", ca_file)
-    os.replace(f"{serial_file}.tmp", serial_file)
+        os.replace(f"{cert_file}.tmp", cert_file)
+        os.replace(f"{key_file}.tmp", key_file)
+        os.replace(f"{ca_file}.tmp", ca_file)
+        os.replace(f"{serial_file}.tmp", serial_file)
 
-    for p in [cert_file, key_file, ca_file, serial_file]:
-        os.chmod(p, 0o600)
-        try:
-            import shutil
-            shutil.chown(p, user="mysql", group="mysql")
-        except Exception:
-            pass
+        for p in [cert_file, key_file, ca_file, serial_file]:
+            os.chmod(p, 0o600)
+            try:
+                import shutil
+                shutil.chown(p, user="mysql", group="mysql")
+            except Exception:
+                pass
 
-    # Trigger Zero-Downtime Hot Reload
-    reload_mysql_tls()
+        # Trigger Zero-Downtime Hot Reload
+        reload_mysql_tls()
 
-    meta = parse_x509_pem(cert)
-    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        meta = parse_x509_pem(cert)
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    with STATE_LOCK:
-        CERT_META["serial"] = meta.get("serial") or serial
-        CERT_META["valid_from"] = meta.get("valid_from")
-        CERT_META["valid_to"] = meta.get("valid_to")
-        CERT_META["issuer"] = meta.get("issuer") or "Enterprise Demo Intermediate CA"
-        CERT_META["subject"] = meta.get("subject") or f"CN={COMMON_NAME}"
-        CERT_META["last_renewed"] = now_iso
-        CERT_META["status"] = "ACTIVE"
-        CONFIG["last_renewal_ts"] = time.time()
+        with STATE_LOCK:
+            CERT_META["serial"] = meta.get("serial") or serial
+            CERT_META["valid_from"] = meta.get("valid_from")
+            CERT_META["valid_to"] = meta.get("valid_to")
+            CERT_META["issuer"] = meta.get("issuer") or "Enterprise Demo Intermediate CA"
+            CERT_META["subject"] = meta.get("subject") or f"CN={COMMON_NAME}"
+            CERT_META["last_renewed"] = now_iso
+            CERT_META["status"] = "ACTIVE"
+            CONFIG["last_renewal_ts"] = time.time()
 
-    log_msg(f"MySQL TLS certificate updated! (Serial: {CERT_META['serial']})")
-    return True, CERT_META["serial"]
+        log_msg(f"MySQL TLS certificate updated! (Serial: {CERT_META['serial']})")
+        return True, CERT_META["serial"]
+    except Exception as e:
+        log_msg(f"Error in issue_and_apply_cert: {e}")
+        return False, str(e)
 
 class AgentHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args): pass
@@ -311,7 +315,10 @@ def rotation_worker():
             issue_and_apply_cert()
 
 if __name__ == "__main__":
-    issue_and_apply_cert()
+    try:
+        issue_and_apply_cert()
+    except Exception as e:
+        log_msg(f"Startup certificate warning: {e}")
     t = threading.Thread(target=rotation_worker, daemon=True)
     t.start()
     socketserver.TCPServer.allow_reuse_address = True
