@@ -97,8 +97,12 @@ import subprocess
 import threading
 from datetime import datetime, timezone
 
-sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
+if hasattr(sys.stdout, "reconfigure"):
+    try: sys.stdout.reconfigure(line_buffering=True)
+    except Exception: pass
+if hasattr(sys.stderr, "reconfigure"):
+    try: sys.stderr.reconfigure(line_buffering=True)
+    except Exception: pass
 
 PORT = int(os.environ.get("AGENT_PORT", "8002"))
 VAULT_ADDR = os.environ.get("VAULT_ADDR", "http://vault.clm-vault-demo.svc.cluster.local:8200")
@@ -338,6 +342,7 @@ After=network.target mysqld.service mariadb.service
 [Service]
 Type=simple
 User=root
+Environment=PYTHONUNBUFFERED=1
 Environment=VAULT_ADDR=${VAULT_ADDR}
 Environment=VAULT_TOKEN=${VAULT_TOKEN}
 Environment=PKI_ROLE=${PKI_ROLE}
