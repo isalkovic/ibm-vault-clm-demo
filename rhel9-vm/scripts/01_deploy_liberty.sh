@@ -30,15 +30,20 @@ if [ ! -d "$WLP_HOME" ]; then
     curl -sSL -o "/tmp/${LIBERTY_ZIP}" "https://public.dhe.ibm.com/ibmdl/export/pub/software/openliberty/runtime/release/2024-12-04_1100/openliberty-runtime-24.0.0.12.zip"
   }
   echo "[+] Extracting Open Liberty to $WLP_INSTALL_DIR..."
-  unzip -q "/tmp/${LIBERTY_ZIP}" -d "$WLP_INSTALL_DIR"
+  unzip -q -o "/tmp/${LIBERTY_ZIP}" -d "$WLP_INSTALL_DIR"
   rm -f "/tmp/${LIBERTY_ZIP}"
 fi
+
+# Ensure executable scripts and correct read permissions across WLP directory
+chmod -R a+rX "$WLP_INSTALL_DIR"
+chmod -R 755 "$WLP_HOME/bin" 2>/dev/null || true
+chown -R wlp:wlp "$WLP_INSTALL_DIR"
 
 # Create server instance if not present
 SERVER_DIR="$WLP_HOME/usr/servers/clmServer"
 if [ ! -d "$SERVER_DIR" ]; then
   echo "[+] Creating Open Liberty server 'clmServer'..."
-  sudo -u wlp "$WLP_HOME/bin/server" create clmServer
+  sudo -u wlp "$WLP_HOME/bin/server" create clmServer || "$WLP_HOME/bin/server" create clmServer
 fi
 
 chown -R wlp:wlp "$WLP_INSTALL_DIR"
