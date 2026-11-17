@@ -111,7 +111,11 @@ def vault_request(path, method="GET", payload=None):
     req.add_header("X-Vault-Token", VAULT_TOKEN)
     req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=5.0) as resp:
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with urllib.request.urlopen(req, timeout=5.0, context=ctx) as resp:
             return json.loads(resp.read().decode())
     except Exception as e:
         log_msg(f"Vault API error on {path}: {e}")
