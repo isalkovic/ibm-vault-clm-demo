@@ -7,10 +7,7 @@ set -euo pipefail
 # ==============================================================================
 
 echo "--- [1/2] Installing Java 17 & System Utilities on RHEL 9 ---"
-dnf install -y java-17-openjdk java-17-openjdk-devel curl wget unzip jq openssl python3 python3-pip
-
-# Ensure cryptography module is available for PKCS12 generation
-python3 -m pip install --quiet cryptography requests || true
+dnf install -y java-17-openjdk java-17-openjdk-devel curl wget unzip jq openssl python3 python3-pip python3-cryptography python3-requests
 
 echo "--- [2/2] Installing Open Liberty Runtime ---"
 WLP_INSTALL_DIR="/opt/ol"
