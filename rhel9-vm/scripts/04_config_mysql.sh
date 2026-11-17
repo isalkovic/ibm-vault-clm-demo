@@ -296,14 +296,17 @@ EOF
 chmod +x /usr/local/bin/clm-mysql-agent.py
 
 echo "--- [4/4] Creating and starting systemd service for MySQL CLM Agent ---"
-cat <<'EOF' > /etc/systemd/system/clm-mysql-agent.service
+cat <<EOF > /etc/systemd/system/clm-mysql-agent.service
 [Unit]
 Description=Vault CLM Agent for MySQL (RHEL 9)
-After=network.target mysqld.service
+After=network.target mysqld.service mariadb.service
 
 [Service]
 Type=simple
 User=root
+Environment=VAULT_ADDR=${VAULT_ADDR}
+Environment=VAULT_TOKEN=${VAULT_TOKEN}
+Environment=PKI_ROLE=${PKI_ROLE}
 ExecStart=/usr/bin/python3 /usr/local/bin/clm-mysql-agent.py
 Restart=always
 RestartSec=5

@@ -370,7 +370,7 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
 
-cat <<'EOF' > /etc/systemd/system/clm-liberty-agent.service
+cat <<EOF > /etc/systemd/system/clm-liberty-agent.service
 [Unit]
 Description=Vault CLM Agent for Open Liberty (RHEL 9)
 After=network.target
@@ -378,6 +378,10 @@ After=network.target
 [Service]
 Type=simple
 User=root
+Environment=VAULT_ADDR=${VAULT_ADDR}
+Environment=VAULT_TOKEN=${VAULT_TOKEN}
+Environment=PKI_ROLE=${PKI_ROLE}
+Environment=WLP_KEYSTORE_SECRET=clm_wlp_key
 ExecStart=/usr/bin/python3 /usr/local/bin/clm-liberty-agent.py
 Restart=always
 RestartSec=5
