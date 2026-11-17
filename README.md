@@ -114,13 +114,26 @@ oc get route clm-dashboard -n clm-vault-demo -o jsonpath='{.spec.host}'
 For non-containerized enterprise virtual machines running Red Hat Enterprise Linux 9:
 ```bash
 cd rhel9-vm
-sudo ./deploy.sh      # Installs Open Liberty 24.0.0.12, Java 17, and MySQL 8.0
-sudo ./config.sh      # Issues Vault certificates, configures keystores, and starts systemd daemons
-./scripts/05_test_rotation.sh  # Real-time CLI verification and live rotation tester
+
+# 1. Deploy middleware runtimes
+sudo ./deploy.sh
+
+# 2. Configure Vault endpoint (Defaults to OpenShift Route: https://vault-clm-vault-demo.apps.cetcluster.iic.hu.ibm.com)
+export VAULT_ADDR="https://vault-clm-vault-demo.apps.cetcluster.iic.hu.ibm.com"
+export VAULT_TOKEN="root"
+
+# 3. Apply TLS certificates, systemd daemons & automatic health verification
+sudo -E ./config.sh
+
+# 4. Run the live rotation verification inspector
+./scripts/05_test_rotation.sh
 ```
+
 * **Endpoints on RHEL 9 VM:**
-  * Open Liberty HTTPS: `https://<RHEL9_IP>:9443/` (Sidecar API: `http://<RHEL9_IP>:8001/status`)
-  * MySQL 8.0 TLS: `<RHEL9_IP>:3306` (Sidecar API: `http://<RHEL9_IP>:8002/status`)
+  * **Open Liberty HTTPS:** `https://<RHEL9_IP>:9443/` (Agent REST API: `http://<RHEL9_IP>:8001/status`)
+  * **MySQL 8.0 / MariaDB TLS:** `<RHEL9_IP>:3306` (Agent REST API: `http://<RHEL9_IP>:8002/status`)
+  * **Zero-Downtime Reload Mechanisms:** Open Liberty `dynamicUpdate="true"` file watcher and MySQL `ALTER INSTANCE RELOAD TLS;` / `FLUSH SSL;`.
+  * **Central CLM Dashboard Integration:** RHEL 9 VM workloads are automatically ingested into the Central Dashboard, enabling remote on-demand renewals and global schedule synchronization across both OpenShift pods and RHEL virtual machines.
 
 ---
 

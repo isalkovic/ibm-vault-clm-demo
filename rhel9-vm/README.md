@@ -36,10 +36,10 @@ rhel9-vm/
 
 ### Prerequisites
 1. A fresh or existing **RHEL 9 VM** with root / sudo privileges.
-2. Network connectivity to HashiCorp Vault (e.g. running on OpenShift or standalone).
-3. Environment variables (optional, defaults to demo values):
+2. Network connectivity to HashiCorp Vault (OpenShift Route or Standalone).
+3. Environment variables (optional, defaults to preset OpenShift Route):
    ```bash
-   export VAULT_ADDR="http://<VAULT_IP_OR_HOSTNAME>:8200"
+   export VAULT_ADDR="https://vault-clm-vault-demo.apps.cetcluster.iic.hu.ibm.com"
    export VAULT_TOKEN="root"
    ```
 
@@ -58,12 +58,13 @@ sudo ./deploy.sh
 ### Step 2: Configure TLS Certificates & Vault Rotation Daemons
 Run as root:
 ```bash
-sudo ./config.sh
+sudo -E ./config.sh
 ```
 * **What it does:**
   1. **Open Liberty:** Configures `server.xml` with PKCS12 keystore (`key.p12`), enables `dynamicUpdate="true"` with `monitorInterval="2s"`, deploys an IBM Carbon styled sample application, and starts the `clm-liberty-agent.service` daemon (port 8001).
-  2. **MySQL 8.0:** Sets `require_secure_transport = ON` in `/etc/my.cnf.d/clm-tls.cnf`, creates the local reload user `clm_admin@localhost`, establishes strict `0600` permissions on `/var/lib/mysql/certs/`, and starts the `clm-mysql-agent.service` daemon (port 8002).
+  2. **MySQL 8.0 / MariaDB:** Sets `require_secure_transport = ON` in `/etc/my.cnf.d/clm-tls.cnf`, creates the local reload user `clm_admin@localhost` (supporting both MariaDB `unix_socket` and MySQL `auth_socket`), establishes strict `0600` permissions on `/var/lib/mysql/certs/`, and starts the `clm-mysql-agent.service` daemon (port 8002).
   3. **Initial Issuance:** Both agents request fresh X.509 certificates from Vault PKI, write them to disk, and trigger zero-downtime runtime reloads.
+  4. **Automatic Verification:** Automatically verifies service health and probes both Agent REST APIs (ports 8001 & 8002).
 
 ---
 
