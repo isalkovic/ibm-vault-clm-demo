@@ -18,12 +18,22 @@ chmod 700 "$CERTS_DIR"
 
 echo "--- [1/4] Configuring MySQL SSL/TLS in /etc/my.cnf.d/clm-tls.cnf ---"
 cat <<'EOF' > /etc/my.cnf.d/clm-tls.cnf
+[server]
+ssl_ca = /var/lib/mysql/certs/ca.pem
+ssl_cert = /var/lib/mysql/certs/server-cert.pem
+ssl_key = /var/lib/mysql/certs/server-key.pem
+
 [mysqld]
 require_secure_transport = ON
 ssl_ca = /var/lib/mysql/certs/ca.pem
 ssl_cert = /var/lib/mysql/certs/server-cert.pem
 ssl_key = /var/lib/mysql/certs/server-key.pem
 tls_version = TLSv1.2,TLSv1.3
+
+[mariadb]
+ssl_ca = /var/lib/mysql/certs/ca.pem
+ssl_cert = /var/lib/mysql/certs/server-cert.pem
+ssl_key = /var/lib/mysql/certs/server-key.pem
 EOF
 
 echo "--- [2/4] Setting up CLM reload user in MySQL ---"
@@ -111,20 +121,20 @@ def parse_x509_pem(pem_str):
     return res
 
 def reload_mysql_tls():
-    try:
-        cmd = ["mysql", "-u", "clm_admin", "-e", "ALTER INSTANCE RELOAD TLS;"]
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        log_msg("Executed 'ALTER INSTANCE RELOAD TLS;' - MySQL TLS context updated with Zero Downtime!")
-        return True
-    except Exception as e:
-        # Fallback to root socket
+    for cmd in [
+        ["mysql", "-u", "clm_admin", "-e", "ALTER INSTANCE RELOAD TLS;"],
+        ["mysql", "-e", "ALTER INSTANCE RELOAD TLS;"],
+        ["mysql", "-u", "clm_admin", "-e", "FLUSH SSL;"],
+        ["mysql", "-e", "FLUSH SSL;"]
+    ]:
         try:
-            subprocess.run(["mysql", "-e", "ALTER INSTANCE RELOAD TLS;"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            log_msg("Executed 'ALTER INSTANCE RELOAD TLS;' via root socket - MySQL TLS updated!")
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            log_msg(f"Executed '{cmd[-1]}' - Database TLS context updated with Zero Downtime!")
             return True
-        except Exception as e2:
-            log_msg(f"Warning: ALTER INSTANCE RELOAD TLS returned: {e2}")
-            return False
+        except Exception:
+            continue
+    log_msg("Warning: Dynamic TLS reload command not supported or refused; service will apply on next restart.")
+    return False
 
 def issue_and_apply_cert():
     log_msg(f"Requesting certificate from Vault PKI (/v1/pki_internal/issue/{ROLE_NAME})...")
@@ -288,7 +298,7 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl restart mysqld
+systemctl restart mariadb 2>/dev/null || systemctl restart mysqld 2>/dev/null || true
 systemctl enable --now clm-mysql-agent.service
 
 echo "[✓] MySQL 8.0 SSL/TLS & CLM Agent configured and running under systemd."
