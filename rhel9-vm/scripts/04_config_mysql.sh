@@ -13,10 +13,21 @@ PKI_ROLE="${PKI_ROLE:-mysql-role}"
 
 CERTS_DIR="/var/lib/mysql/certs"
 mkdir -p "$CERTS_DIR"
-chown -R mysql:mysql "$CERTS_DIR"
 chmod 700 "$CERTS_DIR"
+chown -R mysql:mysql "$CERTS_DIR" 2>/dev/null || true
 
-echo "--- [1/4] Configuring MySQL SSL/TLS in /etc/my.cnf.d/clm-tls.cnf ---"
+echo "--- [1/4] Ensuring Database Service is active and generating initial TLS certs ---"
+# Generate initial bootstrap certificate so files exist before configuring TLS
+if [ ! -f "$CERTS_DIR/server-cert.pem" ]; then
+  openssl req -x509 -newkey rsa:2048 -keyout "$CERTS_DIR/server-key.pem" \
+    -out "$CERTS_DIR/server-cert.pem" -days 1 -nodes -subj "/CN=mysql-rhel.clm.internal" 2>/dev/null || true
+  cp "$CERTS_DIR/server-cert.pem" "$CERTS_DIR/ca.pem"
+  echo "BOOTSTRAP-INIT" > "$CERTS_DIR/serial.txt"
+fi
+chmod 600 "$CERTS_DIR"/*.pem "$CERTS_DIR"/*.txt 2>/dev/null || true
+chown -R mysql:mysql "$CERTS_DIR" 2>/dev/null || true
+
+echo "--- [2/4] Configuring MySQL/MariaDB SSL/TLS in /etc/my.cnf.d/clm-tls.cnf ---"
 cat <<'EOF' > /etc/my.cnf.d/clm-tls.cnf
 [server]
 ssl_ca = /var/lib/mysql/certs/ca.pem
@@ -36,8 +47,20 @@ ssl_cert = /var/lib/mysql/certs/server-cert.pem
 ssl_key = /var/lib/mysql/certs/server-key.pem
 EOF
 
-echo "--- [2/4] Setting up CLM reload user in MySQL / MariaDB ---"
-# Create admin user for non-interactive reload via local socket (handles MariaDB unix_socket and MySQL auth_socket)
+# Start/Restart database and wait for socket readiness
+echo "[+] Starting / Verifying database service readiness..."
+systemctl restart mariadb 2>/dev/null || systemctl restart mysqld 2>/dev/null || \
+systemctl start mariadb 2>/dev/null || systemctl start mysqld 2>/dev/null || true
+
+for i in {1..15}; do
+  if mysqladmin --silent ping 2>/dev/null || [ -S /var/lib/mysql/mysql.sock ] || [ -S /run/mariadb/mariadb.sock ]; then
+    echo "[+] Database socket is ready."
+    break
+  fi
+  sleep 1
+done
+
+echo "[+] Setting up CLM reload user in MySQL / MariaDB..."
 mysql -u root <<'EOF' 2>/dev/null || mysql <<'EOF' 2>/dev/null || true
 -- MariaDB socket authentication
 CREATE USER IF NOT EXISTS 'clm_admin'@'localhost' IDENTIFIED VIA unix_socket;
