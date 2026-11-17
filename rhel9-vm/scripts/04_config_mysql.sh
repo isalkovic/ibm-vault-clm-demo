@@ -7,7 +7,7 @@ set -euo pipefail
 #          installs Python CLM agent, and tests live ALTER INSTANCE RELOAD TLS.
 # ==============================================================================
 
-VAULT_ADDR="${VAULT_ADDR:-http://vault.clm-vault-demo.svc.cluster.local:8200}"
+VAULT_ADDR="${VAULT_ADDR:-https://vault-clm-vault-demo.apps.cetcluster.iic.hu.ibm.com}"
 VAULT_TOKEN="${VAULT_TOKEN:-root}"
 PKI_ROLE="${PKI_ROLE:-mysql-role}"
 
@@ -105,7 +105,7 @@ if hasattr(sys.stderr, "reconfigure"):
     except Exception: pass
 
 PORT = int(os.environ.get("AGENT_PORT", "8002"))
-VAULT_ADDR = os.environ.get("VAULT_ADDR", "http://vault.clm-vault-demo.svc.cluster.local:8200")
+VAULT_ADDR = os.environ.get("VAULT_ADDR", "https://vault-clm-vault-demo.apps.cetcluster.iic.hu.ibm.com")
 VAULT_TOKEN = os.environ.get("VAULT_TOKEN", "root")
 ROLE_NAME = os.environ.get("PKI_ROLE", "mysql-role")
 COMMON_NAME = os.environ.get("COMMON_NAME", "mysql-rhel.clm.internal")
@@ -297,6 +297,16 @@ class AgentHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"success": True, "serial": res, "message": f"MySQL TLS cert renewed (Serial: {res})"})
             else:
                 self.send_json({"success": False, "error": res}, code=500)
+        elif clean_path == "/schedule":
+            content_len = int(self.headers.get("Content-Length", 0))
+            post_body = self.rfile.read(content_len).decode("utf-8") if content_len > 0 else "{}"
+            try: body = json.loads(post_body)
+            except Exception: body = {}
+            new_interval = int(body.get("interval_seconds", 300))
+            with STATE_LOCK:
+                CONFIG["interval_seconds"] = new_interval
+            log_msg(f"Updated rotation interval to {new_interval}s via Agent REST API.")
+            self.send_json({"success": True, "interval_seconds": new_interval})
         else:
             self.send_error(404, "Endpoint not found")
 

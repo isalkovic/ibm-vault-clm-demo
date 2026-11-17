@@ -22,13 +22,18 @@ data:
     import base64
     from datetime import datetime, timezone, timedelta
 
-    sys.stdout.reconfigure(line_buffering=True)
-    sys.stderr.reconfigure(line_buffering=True)
+    if hasattr(sys.stdout, "reconfigure"):
+        try: sys.stdout.reconfigure(line_buffering=True)
+        except Exception: pass
+    if hasattr(sys.stderr, "reconfigure"):
+        try: sys.stderr.reconfigure(line_buffering=True)
+        except Exception: pass
 
     PORT = 8080
-    VAULT_ADDR = os.environ.get("VAULT_ADDR", "http://vault.clm-vault-demo.svc.cluster.local:8200")
+    VAULT_ADDR = os.environ.get("VAULT_ADDR", "https://vault-clm-vault-demo.apps.cetcluster.iic.hu.ibm.com")
     K8S_API = "https://kubernetes.default.svc"
     NAMESPACE = os.environ.get("NAMESPACE", "clm-vault-demo")
+    RHEL_VM_HOST = os.environ.get("RHEL_VM_HOST", "10.112.10.1")
 
     # In-memory audit log
     AUDIT_LOGS = []
@@ -56,9 +61,14 @@ data:
         return ""
 
     def sidecar_request(slug, path="status", method="GET", payload=None, timeout=3.5):
-        """Dashboard communicates strictly with workload sidecars on port 8000."""
-        host = f"{slug}.{NAMESPACE}.svc.cluster.local"
-        url = f"http://{host}:8000/{path.lstrip('/')}"
+        """Dashboard communicates strictly with workload sidecars (port 8000) and RHEL VM agents (ports 8001/8002)."""
+        if slug == "liberty-rhel":
+            url = f"http://{RHEL_VM_HOST}:8001/{path.lstrip('/')}"
+        elif slug == "mysql-rhel":
+            url = f"http://{RHEL_VM_HOST}:8002/{path.lstrip('/')}"
+        else:
+            host = f"{slug}.{NAMESPACE}.svc.cluster.local"
+            url = f"http://{host}:8000/{path.lstrip('/')}"
         data = json.dumps(payload).encode("utf-8") if payload else None
         req = urllib.request.Request(url, data=data, method=method)
         req.add_header("Content-Type", "application/json")
@@ -105,7 +115,10 @@ data:
     def get_workload_data(scenario_info, is_postgres=False):
         """Collects workload certificate status directly from the workload sidecar agent."""
         slug = scenario_info["slug"]
-        tls_host = f"{slug}.{NAMESPACE}.svc.cluster.local"
+        if slug in ("liberty-rhel", "mysql-rhel"):
+            tls_host = RHEL_VM_HOST
+        else:
+            tls_host = f"{slug}.{NAMESPACE}.svc.cluster.local"
         tls_port = scenario_info["port"]
 
         # 1. Query sidecar agent directly (Dashboard -> Sidecar)
@@ -165,20 +178,21 @@ data:
 
     def renew_via_sidecar(slug):
         """Dashboard asks the sidecar to renew its certificate directly with Vault."""
-        log_event(slug.upper(), "Ručna obnova (Dashboard -> Sidecar)", "IN_PROGRESS", f"Slanje zahtjeva za obnovu prema {slug} sidecar agentu...")
+        agent_label = "RHEL Agent" if "rhel" in slug else "Sidecar Agent"
+        log_event(slug.upper(), f"Ručna obnova (Dashboard -> {agent_label})", "IN_PROGRESS", f"Slanje zahtjeva za obnovu prema {slug} agentu...")
         res = sidecar_request(slug, path="renew", method="POST", timeout=12.0)
         
         if res.get("success"):
             new_serial = res.get("serial", "")
-            log_event(slug.upper(), "Ručna obnova (Sidecar -> Vault PKI)", "SUCCESS", f"Sidecar uspješno obnovio i primijenio certifikat: {new_serial}")
+            log_event(slug.upper(), f"Ručna obnova ({agent_label} -> Vault PKI)", "SUCCESS", f"Uspješno obnovljen i primijenjen certifikat: {new_serial}")
             return {
                 "success": True,
                 "serial": new_serial,
-                "message": f"Certifikat za {slug} uspješno obnovljen putem Sidecara (Serial: {new_serial})!"
+                "message": f"Certifikat za {slug} uspješno obnovljen putem Agenta (Serial: {new_serial})!"
             }
         else:
-            err_msg = res.get("error") or res.get("message") or "Sidecar nije dostupan"
-            log_event(slug.upper(), "Ručna obnova (Sidecar -> Vault PKI)", "FAILED", f"Greška: {err_msg}")
+            err_msg = res.get("error") or res.get("message") or "Agent nije dostupan"
+            log_event(slug.upper(), f"Ručna obnova ({agent_label} -> Vault PKI)", "FAILED", f"Greška: {err_msg}")
             return {
                 "success": False,
                 "error": err_msg,
@@ -187,7 +201,7 @@ data:
 
     def schedule_via_sidecar(slug, interval):
         """Dashboard updates rotation interval directly on the workload sidecars."""
-        targets = ["liberty", "tomcat", "nginx", "postgres"] if slug == "global" else [slug]
+        targets = ["liberty", "tomcat", "nginx", "postgres", "liberty-rhel", "mysql-rhel"] if slug == "global" else [slug]
         for t in targets:
             sidecar_request(t, path="schedule", method="POST", payload={"interval_seconds": interval}, timeout=3.0)
         log_event(slug.upper(), "Postavljanje rasporeda (Schedule)", "SUCCESS", f"Interval rotacije postavljen na {interval}s.")
@@ -277,8 +291,8 @@ data:
                     {
                         "id": 1,
                         "slug": "liberty",
-                        "name": "Open Liberty Java Server",
-                        "scenario": "Scenario 1: Interni Vault PKI",
+                        "name": "Open Liberty Java Server (OpenShift)",
+                        "scenario": "Scenario 1: Interni Vault PKI (K8s Container)",
                         "ca_provider": "Vault Internal PKI (/v1/pki_internal)",
                         "keystore_format": "PKCS12 Keystore (/config/resources/security/key.p12)",
                         "reload_mechanism": "Open Liberty dynamicUpdate='true' (Zero Downtime)",
@@ -289,7 +303,7 @@ data:
                     {
                         "id": 2,
                         "slug": "tomcat",
-                        "name": "Apache Tomcat Web Server",
+                        "name": "Apache Tomcat Web Server (OpenShift)",
                         "scenario": "Scenario 2: Let's Encrypt / DigiCert Public CA (Pattern A)",
                         "ca_provider": "Vault Intermediary Public CA Proxy (Let's Encrypt / DigiCert)",
                         "keystore_format": "X.509 PEM / PKCS12 (/usr/local/tomcat/conf/ssl/)",
@@ -301,7 +315,7 @@ data:
                     {
                         "id": 3,
                         "slug": "nginx",
-                        "name": "NGINX Reverse Proxy",
+                        "name": "NGINX Reverse Proxy (OpenShift)",
                         "scenario": "Scenario 3: Vault Native ACME Protokol",
                         "ca_provider": "Vault Native ACME Server (/v1/pki_internal/acme)",
                         "keystore_format": "X.509 PEM (/etc/nginx/ssl/fullchain.pem)",
@@ -313,7 +327,7 @@ data:
                     {
                         "id": 6,
                         "slug": "postgres",
-                        "name": "PostgreSQL Database",
+                        "name": "PostgreSQL Database (OpenShift)",
                         "scenario": "Scenario 6: Sigurnost Baza Podataka (DB TLS)",
                         "ca_provider": "Vault Internal PKI (/v1/pki_internal)",
                         "keystore_format": "X.509 PEM sa strogim '0600' dozvolama",
@@ -321,6 +335,30 @@ data:
                         "port": 5432
                     },
                     is_postgres=True
+                ),
+                get_workload_data(
+                    {
+                        "id": 8,
+                        "slug": "liberty-rhel",
+                        "name": "Open Liberty Java 17 (RHEL 9 VM)",
+                        "scenario": "Scenario 8: Samostalni RHEL 9 VM (Java 17 PKCS12)",
+                        "ca_provider": "Vault Internal PKI (/v1/pki_internal)",
+                        "keystore_format": "PKCS12 Keystore (/opt/ol/.../key.p12)",
+                        "reload_mechanism": "Open Liberty dynamicUpdate='true' File Monitor",
+                        "port": 9443
+                    }
+                ),
+                get_workload_data(
+                    {
+                        "id": 9,
+                        "slug": "mysql-rhel",
+                        "name": "MySQL 8.0 / MariaDB (RHEL 9 VM)",
+                        "scenario": "Scenario 9: Baza podataka na RHEL 9 VM (0600 PEM)",
+                        "ca_provider": "Vault Internal PKI (/v1/pki_internal)",
+                        "keystore_format": "X.509 PEM (/var/lib/mysql/certs/)",
+                        "reload_mechanism": "SQL 'ALTER INSTANCE RELOAD TLS;' (Zero Downtime)",
+                        "port": 3306
+                    }
                 ),
                 {
                     "id": 7,
@@ -360,9 +398,12 @@ data:
             self.send_json({"audit_logs": AUDIT_LOGS})
 
         def handle_api_probe(self, workload):
-            port_map = {"liberty": 9443, "tomcat": 8443, "nginx": 8443, "postgres": 5432}
+            port_map = {
+                "liberty": 9443, "tomcat": 8443, "nginx": 8443, "postgres": 5432,
+                "liberty-rhel": 9443, "mysql-rhel": 3306
+            }
             port = port_map.get(workload, 8443)
-            host = f"{workload}.{NAMESPACE}.svc.cluster.local"
+            host = RHEL_VM_HOST if workload in ("liberty-rhel", "mysql-rhel") else f"{workload}.{NAMESPACE}.svc.cluster.local"
             res = probe_tls_certificate(host, port, is_postgres=(workload == "postgres"))
             self.send_json(res)
 
