@@ -36,11 +36,26 @@ ssl_cert = /var/lib/mysql/certs/server-cert.pem
 ssl_key = /var/lib/mysql/certs/server-key.pem
 EOF
 
-echo "--- [2/4] Setting up CLM reload user in MySQL ---"
-# Create admin user for non-interactive ALTER INSTANCE RELOAD TLS via local socket
-mysql -u root <<'EOF' || true
+echo "--- [2/4] Setting up CLM reload user in MySQL / MariaDB ---"
+# Create admin user for non-interactive reload via local socket (handles MariaDB unix_socket and MySQL auth_socket)
+mysql -u root <<'EOF' 2>/dev/null || mysql <<'EOF' 2>/dev/null || true
+-- MariaDB socket authentication
+CREATE USER IF NOT EXISTS 'clm_admin'@'localhost' IDENTIFIED VIA unix_socket;
+GRANT RELOAD, RELOAD PRIVILEGE ON *.* TO 'clm_admin'@'localhost';
+FLUSH PRIVILEGES;
+EOF
+
+mysql -u root <<'EOF' 2>/dev/null || true
+-- MySQL 8.0 auth_socket authentication
 CREATE USER IF NOT EXISTS 'clm_admin'@'localhost' IDENTIFIED WITH auth_socket;
 GRANT RELOAD, SYSTEM_VARIABLES_ADMIN ON *.* TO 'clm_admin'@'localhost';
+FLUSH PRIVILEGES;
+EOF
+
+mysql -u root <<'EOF' 2>/dev/null || true
+-- Fallback generic user
+CREATE USER IF NOT EXISTS 'clm_admin'@'localhost';
+GRANT RELOAD ON *.* TO 'clm_admin'@'localhost';
 FLUSH PRIVILEGES;
 EOF
 
@@ -122,10 +137,10 @@ def parse_x509_pem(pem_str):
 
 def reload_mysql_tls():
     for cmd in [
-        ["mysql", "-u", "clm_admin", "-e", "ALTER INSTANCE RELOAD TLS;"],
+        ["mysql", "-e", "FLUSH SSL;"],
         ["mysql", "-e", "ALTER INSTANCE RELOAD TLS;"],
         ["mysql", "-u", "clm_admin", "-e", "FLUSH SSL;"],
-        ["mysql", "-e", "FLUSH SSL;"]
+        ["mysql", "-u", "clm_admin", "-e", "ALTER INSTANCE RELOAD TLS;"]
     ]:
         try:
             subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
