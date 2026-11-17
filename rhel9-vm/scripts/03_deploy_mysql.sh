@@ -9,12 +9,13 @@ set -euo pipefail
 echo "--- [1/2] Verifying / Installing MySQL / MariaDB Database Server ---"
 DB_SERVICE="mysqld"
 
-if rpm -q mariadb-server >/dev/null 2>&1 || rpm -q mariadb >/dev/null 2>&1; then
-  MARIADB_PKG=$(rpm -q mariadb-server 2>/dev/null || rpm -q mariadb)
-  echo "[+] Detected installed MariaDB package: $MARIADB_PKG"
+if rpm -qa | grep -q -E "^mariadb"; then
+  echo "[+] Detected installed MariaDB packages on system."
   if ! rpm -q mariadb-server >/dev/null 2>&1; then
-    echo "[+] Installing mariadb-server to complement existing mariadb installation..."
+    echo "[+] Installing mariadb-server package to complete database setup..."
     dnf install -y mariadb-server
+  else
+    echo "[+] mariadb-server is already installed."
   fi
   DB_SERVICE="mariadb"
 elif rpm -q mysql-server >/dev/null 2>&1; then
@@ -22,7 +23,7 @@ elif rpm -q mysql-server >/dev/null 2>&1; then
   echo "[+] Detected existing MySQL Server package: $INSTALLED_PKG"
   DB_SERVICE="mysqld"
 else
-  echo "[+] Installing Database Server via dnf..."
+  echo "[+] Installing Database Server (MariaDB / MySQL compatible) via dnf..."
   dnf install -y mariadb-server || dnf install -y mysql-server mysql
   DB_SERVICE="mariadb"
 fi
