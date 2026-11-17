@@ -16,8 +16,6 @@ systemctl disable openliberty.service 2>/dev/null || true
 systemctl stop clm-mysql-agent.service 2>/dev/null || true
 systemctl disable clm-mysql-agent.service 2>/dev/null || true
 
-systemctl stop mysqld 2>/dev/null || true
-
 echo "--- [2/3] Removing systemd unit files and agent binaries ---"
 rm -f /etc/systemd/system/openliberty.service
 rm -f /etc/systemd/system/clm-liberty-agent.service

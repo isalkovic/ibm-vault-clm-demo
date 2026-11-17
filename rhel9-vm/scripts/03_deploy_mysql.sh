@@ -6,8 +6,15 @@ set -euo pipefail
 # Purpose: Installs MySQL 8.0 Server and client packages on RHEL 9
 # ==============================================================================
 
-echo "--- [1/2] Installing MySQL 8.0 Server on RHEL 9 ---"
-dnf install -y mysql-server mysql
+echo "--- [1/2] Verifying / Installing MySQL 8.0 Server ---"
+if rpm -q mysql-server >/dev/null 2>&1; then
+  INSTALLED_PKG=$(rpm -q mysql-server)
+  echo "[+] Detected existing MySQL Server package: $INSTALLED_PKG"
+  echo "[+] Reusing existing MySQL 8.0 installation."
+else
+  echo "[+] Installing MySQL 8.0 Server via dnf..."
+  dnf install -y mysql-server mysql
+fi
 
 # Start and enable mysqld service
 systemctl enable --now mysqld
